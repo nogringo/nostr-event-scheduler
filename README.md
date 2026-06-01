@@ -1,39 +1,126 @@
-<!--
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
+# nostr_event_scheduler
 
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages).
+Local-first Dart package for scheduling Nostr events via Scheduler DVMs.
 
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/tools/pub/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages).
--->
-
-TODO: Put a short description of the package here that helps potential users
-know whether this package might be useful for them.
+This package implements the Scheduler DVM protocol and provides a robust, offline-first API for creating, tracking, and cancelling scheduled Nostr events.
 
 ## Features
 
-TODO: List what your package can do. Maybe include images, gifs, or videos.
+- **Local-first** - Every operation is persisted locally before any network attempt
+- **Offline signer support** - Works even when your signer (e.g. NIP-46) is temporarily unavailable
+- **Multi-device sync** - Automatically syncs scheduled jobs across devices
+- **Real-time DVM feedback** - Receives status updates from Scheduler DVMs (`scheduled`, `published`, `failed`, etc.)
+- **No raw event duplication** - Relies on the NDK persistent cache for raw events; only stores decrypted payloads and computed state in Sembast
+- **Controlled network access** - Explicit `startListening` / `stopListening` for fine-grained relay connectivity control
 
-## Getting started
-
-TODO: List prerequisites and provide or point to information on how to
-start using the package.
-
-## Usage
-
-TODO: Include short and useful examples for package users. Add longer examples
-to `/example` folder.
+## Quick start
 
 ```dart
-const like = 'sample';
+import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
+import 'package:ndk/ndk.dart';
+import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
+import 'package:sembast/sembast_io.dart';
+
+Future<void> main() async {
+  final db = await databaseFactoryIo.openDatabase('scheduler.db');
+
+  final ndk = Ndk(
+    NdkConfig(
+      eventVerifier: Bip340EventVerifier(),
+      cache: SembastCacheManager(db),
+      fetchedRangesEnabled: true,
+    ),
+  );
+
+  final broadcast = OfflineBroadcast.withNdk(ndk, db: db);
+  broadcast.start();
+
+  final scheduler = EventScheduler(
+    ndk: ndk,
+    broadcast: broadcast,
+    db: db,
+  );
+
+  await scheduler.startListening();
+
+  // Listen to status updates from the DVM
+  scheduler.statusUpdates.listen((update) {
+    print('Job ${update.jobId}: ${update.status}');
+  });
+
+  // Schedule an event
+  final scheduleAt = DateTime.now().add(const Duration(hours: 1));
+
+  final event = Nip01Event(
+    pubKey: myPubKey,
+    kind: 1,
+    tags: [],
+    content: 'Hello from the future!',
+    createdAt: scheduleAt.millisecondsSinceEpoch ~/ 1000,
+  );
+  final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(event);
+
+  final job = await scheduler.schedule(
+    signedEvent,
+    dvmPubkey,
+    at: scheduleAt,
+    relays: ['wss://relay.damus.io'],
+  );
+
+  print('Scheduled job: ${job.jobId}');
+
+  // List all jobs
+  final jobs = await scheduler.listJobs();
+  print('Total jobs: ${jobs.length}');
+
+  // Cancel a job
+  await scheduler.cancel(job.jobId);
+
+  // Dispose when done
+  await scheduler.dispose();
+  await broadcast.dispose();
+  await db.close();
+}
 ```
 
-## Additional information
+## API Overview
 
-TODO: Tell users more about the package: where to find more information, how to
-contribute to the package, how to file issues, what response they can expect
-from the package authors, and more.
+### EventScheduler
+
+The main entry point.
+
+| Method | Description |
+|--------|-------------|
+| `startListening()` | Starts network subscriptions for sync and DVM feedbacks |
+| `stopListening()` | Stops network subscriptions (scheduler remains usable offline) |
+| `resync()` | Forces a manual resync of schedule requests, deletions, and feedbacks |
+| `schedule(event, dvmPubkey, {at, relays})` | Creates a new scheduled job |
+| `cancel(jobId)` | Cancels a scheduled job by broadcasting a kind:5 deletion |
+| `listJobs()` | Lists all scheduled jobs from the local store |
+| `jobsStream` | Live stream of all scheduled jobs |
+| `statusUpdates` | Stream of DVM feedback status updates |
+| `syncState` | Stream of synchronization state (initial / syncing / synced / error) |
+
+### Models
+
+- `ScheduledJob` - Represents a scheduled event with its current status
+- `JobStatus` - Enum: `pending`, `scheduled`, `published`, `failed`, `cancelled`, `error`
+- `StatusUpdate` - Emitted when a DVM feedback is received
+- `SyncState` - Tracks whether the local state is up-to-date with the network
+
+## Architecture
+
+The package follows a strict **raw vs computed** architecture:
+
+- **Raw events** (kind:5905, kind:5, kind:7000) are stored in the **NDK persistent cache**
+- **Decrypted payloads** and **computed job state** are stored in **Sembast**
+
+This means the computed `jobs` store can be dropped and rebuilt at any time without network access or user action. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
+
+## Testing
+
+The package includes integration tests using a minimal `MockRelay` implementation.
+
+```bash
+dart test
+```

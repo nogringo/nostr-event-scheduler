@@ -1,14 +1,23 @@
 name: nostr_event_scheduler
-description: A starting point for Dart libraries or applications.
-version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+description: Local-first Dart package for scheduling Nostr events via Scheduler DVMs.
+version: 0.1.0
+repository: https://github.com/nogringo/nostr-event-scheduler
+homepage: https://github.com/nogringo/nostr-event-scheduler
 
 environment:
   sdk: ^3.12.0
 
-# Add regular dependencies here.
 dependencies:
-  # path: ^1.9.0
+  ndk: 0.8.4-dev.1
+  sembast: ^3.8.7
+  broadcast_queue_shim_for_ndk: ^0.2.1
+
+topics:
+  - nostr
+  - scheduler
+  - dvm
+  - local-first
+  - offline-first
 
 dev_dependencies:
   lints: ^6.0.0
