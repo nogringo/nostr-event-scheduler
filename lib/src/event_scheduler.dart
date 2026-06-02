@@ -333,9 +333,7 @@ class EventScheduler {
       job.requestEventId,
       deletionEventId: signedDeletion.id,
     );
-    job.status = JobStatus.cancelled;
-    job.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    await _store.putJob(job);
+    await _store.removeJob(job.jobId);
   }
 
   /// Lists all scheduled jobs from the local computed store.
@@ -472,9 +470,7 @@ class EventScheduler {
           .where((j) => j.requestEventId == requestEventId)
           .firstOrNull;
       if (job != null) {
-        job.status = JobStatus.cancelled;
-        job.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-        await _store.putJob(job);
+        await _store.removeJob(job.jobId);
       }
     }
   }
@@ -540,7 +536,9 @@ class EventScheduler {
       );
 
       final dvmPubkey = event.getFirstTag('p') ?? '';
-      final isCancelled = await _store.isTombstoned(event.id);
+      if (await _store.isTombstoned(event.id)) {
+        return;
+      }
 
       final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final job = ScheduledJob(
@@ -550,7 +548,7 @@ class EventScheduler {
         scheduleAt: scheduleAt,
         targetEvent: targetEvent,
         targetRelays: targetRelays,
-        status: isCancelled ? JobStatus.cancelled : JobStatus.pending,
+        status: JobStatus.pending,
         createdAt: now,
         updatedAt: now,
       );
@@ -654,7 +652,9 @@ class EventScheduler {
           sig: signedEventMap['sig'] as String,
         );
 
-        final isCancelled = await _store.isTombstoned(eventId);
+        if (await _store.isTombstoned(eventId)) {
+          return null;
+        }
 
         // For rebuild, we don't know the dvmPubkey from the payload alone.
         // We try to fetch the kind:5905 event from NDK cache to get the p tag.
@@ -677,7 +677,7 @@ class EventScheduler {
           scheduleAt: scheduleAt,
           targetEvent: targetEvent,
           targetRelays: targetRelays,
-          status: isCancelled ? JobStatus.cancelled : JobStatus.pending,
+          status: JobStatus.pending,
           createdAt: now,
           updatedAt: now,
         );
