@@ -116,13 +116,10 @@ class EventScheduler {
       _onScheduleEvent,
     );
 
-    // kind:5
-    await _queryWithFetchedRanges(
-      Filter(authors: [pubkey], kinds: [5]),
-      0,
-      now,
-      _onDeletionEvent,
-    );
+    // kind:5 (deletions of kind 5905)
+    final deletionFilter = Filter(authors: [pubkey], kinds: [5]);
+    deletionFilter.setTag('k', ['5905']);
+    await _queryWithFetchedRanges(deletionFilter, 0, now, _onDeletionEvent);
 
     // kind:7000
     final jobs = await _store.listJobs();
@@ -312,6 +309,7 @@ class EventScheduler {
       kind: 5,
       tags: [
         ['e', job.requestEventId],
+        ['k', '5905'],
       ],
       content: 'cancel',
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
@@ -375,9 +373,11 @@ class EventScheduler {
     _syncResponses.add(scheduleResponse);
     _syncSubscriptions.add(scheduleResponse.stream.listen(_onScheduleEvent));
 
-    // kind:5 subscription
+    // kind:5 subscription (deletions of kind 5905)
+    final deletionFilter = Filter(authors: [pubkey], kinds: [5]);
+    deletionFilter.setTag('k', ['5905']);
     final deletionResponse = _ndk.requests.subscription(
-      filter: Filter(authors: [pubkey], kinds: [5]),
+      filter: deletionFilter,
       id: 'scheduler-sync-5',
     );
     _syncResponses.add(deletionResponse);
