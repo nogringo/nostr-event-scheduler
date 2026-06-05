@@ -2,7 +2,10 @@
 library;
 
 export 'src/models/job_status.dart';
+export 'src/models/schedule_package_item.dart';
+export 'src/models/scheduled_item.dart';
 export 'src/models/scheduled_job.dart';
+export 'src/models/scheduled_package.dart';
 export 'src/models/status_update.dart';
 export 'src/models/sync_state.dart';
 export 'src/event_scheduler.dart';

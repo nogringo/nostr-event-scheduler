@@ -11,6 +11,8 @@ import 'package:ndk/domain_layer/entities/nip_65.dart';
 import 'package:ndk/domain_layer/entities/read_write_marker.dart';
 import 'mocks/mock_relay.dart';
 import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
+import 'package:nostr_scheduler_dvm/nostr_scheduler_dvm.dart';
+import 'package:sembast/sembast.dart' as sembast;
 import 'package:sembast/sembast_memory.dart';
 import 'package:test/test.dart';
 
@@ -29,6 +31,18 @@ Future<EventScheduler> createScheduler({
   );
 
   return scheduler;
+}
+
+Future<void> _waitFor(
+  FutureOr<bool> Function() condition, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (await condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+  }
+  throw TimeoutException('Condition not met after $timeout');
 }
 
 void main() {
@@ -73,8 +87,25 @@ void main() {
     );
     relay.storedEvents.add(signedNip65);
 
-    broadcastDb = await databaseFactoryMemory.openDatabase('broadcast_test.db');
-    schedulerDb = await databaseFactoryMemory.openDatabase('scheduler_test.db');
+    final dvmNip65 = Nip65(
+      pubKey: dvmKey.publicKey,
+      relays: {relay.url: ReadWriteMarker.readOnly},
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final signedDvmNip65 = Nip01Utils.signWithPrivateKey(
+      event: dvmNip65.toEvent(),
+      privateKey: dvmKey.privateKey!,
+    );
+    relay.storedEvents.add(signedDvmNip65);
+
+    final dbSuffix =
+        '${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(1 << 32)}';
+    broadcastDb = await databaseFactoryMemory.openDatabase(
+      'broadcast_test_$dbSuffix.db',
+    );
+    schedulerDb = await databaseFactoryMemory.openDatabase(
+      'scheduler_test_$dbSuffix.db',
+    );
     scheduler = await createScheduler(
       ndk: ndk,
       broadcastDb: broadcastDb,
@@ -125,6 +156,222 @@ void main() {
     });
   });
 
+  group('schedulePackage', () {
+    test('broadcasts package manifest and lists logical schedules', () async {
+      final eventA = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'standalone',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final eventB = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'package B',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final eventC = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'package C',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final signedA = await signer.sign(eventA);
+      final signedB = await signer.sign(eventB);
+      final signedC = await signer.sign(eventC);
+
+      await scheduler.schedule(signedA, dvmKey.publicKey, relays: [relay.url]);
+      final package = await scheduler.schedulePackage([
+        SchedulePackageItem(
+          event: signedB,
+          dvmPubkey: dvmKey.publicKey,
+          relays: [relay.url],
+        ),
+        SchedulePackageItem(
+          event: signedC,
+          dvmPubkey: dvmKey.publicKey,
+          relays: [relay.url],
+        ),
+      ], content: 'opaque display context');
+
+      expect(package.jobs, hasLength(2));
+      expect(package.content, 'opaque display context');
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final requests = relay.storedEvents.where((e) => e.kind == 5905);
+      expect(requests, hasLength(greaterThanOrEqualTo(3)));
+
+      final manifests = relay.storedEvents.where((e) => e.kind == 31234);
+      expect(manifests, isNotEmpty);
+      final manifest = manifests.first;
+      expect(manifest.getFirstTag('d'), package.packageId);
+      expect(manifest.getFirstTag('k'), '5905');
+      expect(manifest.getTags('e'), containsAll(package.requestEventIds));
+
+      final decrypted = await Nip44.decryptMessage(
+        manifest.content,
+        clientKey.privateKey!,
+        clientKey.publicKey,
+      );
+      expect(decrypted, 'opaque display context');
+
+      final jobs = await scheduler.listJobs();
+      expect(jobs, hasLength(3));
+
+      final schedules = await scheduler.listSchedules();
+      expect(schedules, hasLength(2));
+      expect(
+        schedules.where((item) => item.type == ScheduledItemType.package),
+        hasLength(1),
+      );
+      expect(
+        schedules.where((item) => item.type == ScheduledItemType.job),
+        hasLength(1),
+      );
+    });
+
+    test('supports DVM read relay fallback per package item', () async {
+      final fallbackDvmKey = Bip340.generatePrivateKey();
+
+      final event = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'fallback dvm relay',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        event,
+      );
+
+      final package = await scheduler.schedulePackage([
+        SchedulePackageItem(
+          event: signedEvent,
+          dvmPubkey: fallbackDvmKey.publicKey,
+          relays: [relay.url],
+          dvmReadRelays: [relay.url],
+        ),
+      ], content: 'fallback context');
+
+      expect(package.jobs.single.dvmPubkey, fallbackDvmKey.publicKey);
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final request = relay.storedEvents.firstWhere(
+        (event) =>
+            event.kind == 5905 &&
+            event.getFirstTag('p') == fallbackDvmKey.publicKey,
+      );
+      expect(request.id, package.requestEventIds.single);
+    });
+
+    test('is accepted by a real scheduler DVM implementation', () async {
+      final dvmNdk = Ndk(
+        NdkConfig(
+          eventVerifier: Bip340EventVerifier(useIsolate: false),
+          cache: MemCacheManager(),
+          engine: NdkEngine.RELAY_SETS,
+          bootstrapRelays: [relay.url],
+          fetchedRangesEnabled: true,
+          defaultQueryTimeout: const Duration(seconds: 2),
+          defaultBroadcastTimeout: const Duration(seconds: 2),
+        ),
+      );
+      dvmNdk.accounts.loginPrivateKey(
+        pubkey: dvmKey.publicKey,
+        privkey: dvmKey.privateKey!,
+      );
+
+      final dvmDb = await databaseFactoryMemory.openDatabase(
+        'dvm_integration_${DateTime.now().microsecondsSinceEpoch}.db',
+      );
+      final dvm = SchedulerDvm(
+        SchedulerDvmConfig(
+          ndk: dvmNdk,
+          database: dvmDb,
+          bootstrapRelays: [relay.url],
+          announceNip89: false,
+        ),
+      );
+
+      addTearDown(() async {
+        await dvm.dispose();
+        await dvmDb.close();
+        await dvmNdk.destroy();
+      });
+
+      await dvm.start();
+      await scheduler.startListening();
+
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final eventB = await signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'real dvm package B',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+      final eventC = await signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'real dvm package C',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+
+      final package = await scheduler.schedulePackage([
+        SchedulePackageItem(
+          event: eventB,
+          dvmPubkey: dvmKey.publicKey,
+          at: DateTime.now().add(const Duration(minutes: 1)),
+          relays: [relay.url],
+        ),
+        SchedulePackageItem(
+          event: eventC,
+          dvmPubkey: dvmKey.publicKey,
+          at: DateTime.now().add(const Duration(minutes: 1)),
+          relays: [relay.url],
+        ),
+      ], content: 'real dvm package context');
+
+      await _waitFor(() async {
+        for (final job in package.jobs) {
+          final stored = await dvm.config.store.getJob(job.jobId);
+          if (stored?.status != DvmJobStatus.scheduled) return false;
+        }
+        return true;
+      });
+
+      await scheduler.resync();
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs();
+        final packageJobIds = package.jobs.map((job) => job.jobId).toSet();
+        return jobs
+            .where((job) => packageJobIds.contains(job.jobId))
+            .every((job) => job.status == JobStatus.scheduled);
+      });
+
+      final schedules = await scheduler.listSchedules();
+      final packageItem = schedules.firstWhere(
+        (item) => item.type == ScheduledItemType.package,
+      );
+      expect(packageItem.package!.jobs, hasLength(2));
+      expect(
+        packageItem.package!.jobs.map((job) => job.status),
+        everyElement(JobStatus.scheduled),
+      );
+    });
+  });
+
   group('cancel', () {
     test('broadcasts a kind:5 deletion event', () async {
       final event = Nip01Event(
@@ -155,6 +402,113 @@ void main() {
       final deletion = deletions.first;
       expect(deletion.getTags('e'), contains(job.requestEventId));
     });
+
+    test('cancelPackage deletes linked jobs and manifest', () async {
+      final eventB = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'cancel package B',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final eventC = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'cancel package C',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final signedB = await signer.sign(eventB);
+      final signedC = await signer.sign(eventC);
+
+      final package = await scheduler.schedulePackage([
+        SchedulePackageItem(
+          event: signedB,
+          dvmPubkey: dvmKey.publicKey,
+          relays: [relay.url],
+        ),
+        SchedulePackageItem(
+          event: signedC,
+          dvmPubkey: dvmKey.publicKey,
+          relays: [relay.url],
+        ),
+      ], content: 'cancel me');
+
+      await scheduler.cancelPackage(package.packageId);
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final deletion = relay.storedEvents.singleWhere(
+        (event) =>
+            event.kind == 5 &&
+            event.getTags('e').contains(package.manifestEventId),
+      );
+      expect(deletion.getTags('e'), containsAll(package.requestEventIds));
+      expect(deletion.getTags('e'), contains(package.manifestEventId));
+      expect(deletion.getTags('k'), containsAll(['5905', '31234']));
+      expect(await scheduler.listJobs(), isEmpty);
+      expect(await scheduler.listPackages(), isEmpty);
+      expect(await scheduler.listSchedules(), isEmpty);
+    });
+
+    test(
+      'cancelPackage deletes request ids when computed jobs are missing',
+      () async {
+        final eventB = Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'missing computed job B',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        );
+        final eventC = Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'missing computed job C',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        );
+        final signer = ndk.accounts.getLoggedAccount()!.signer;
+        final signedB = await signer.sign(eventB);
+        final signedC = await signer.sign(eventC);
+
+        final package = await scheduler.schedulePackage([
+          SchedulePackageItem(
+            event: signedB,
+            dvmPubkey: dvmKey.publicKey,
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: signedC,
+            dvmPubkey: dvmKey.publicKey,
+            relays: [relay.url],
+          ),
+        ], content: 'cancel even without computed jobs');
+
+        await sembast.stringMapStoreFactory.store('jobs').delete(schedulerDb);
+
+        expect(await scheduler.listJobs(), isEmpty);
+        final packages = await scheduler.listPackages();
+        expect(packages.single.requestEventIds, package.requestEventIds);
+        expect(packages.single.jobs, isEmpty);
+
+        await scheduler.cancelPackage(package.packageId);
+
+        await Future.delayed(const Duration(milliseconds: 500));
+
+        final deletion = relay.storedEvents.singleWhere(
+          (event) =>
+              event.kind == 5 &&
+              event.getTags('e').contains(package.manifestEventId),
+        );
+        expect(deletion.getTags('e'), containsAll(package.requestEventIds));
+        expect(deletion.getTags('e'), contains(package.manifestEventId));
+        expect(deletion.getTags('k'), containsAll(['5905', '31234']));
+        expect(await scheduler.listPackages(), isEmpty);
+        expect(await scheduler.listSchedules(), isEmpty);
+      },
+    );
   });
 
   group('multi-device sync', () {
