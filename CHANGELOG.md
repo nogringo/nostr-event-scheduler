@@ -1,3 +1,8 @@
+## 0.2.1
+
+- Bump package version to `0.2.1`.
+- Update `ndk`, `sembast`, `lints`, and `test` dependency versions.
+
 ## 0.2.0
 
 - Add scheduled package support via `kind:31234` manifests that group one or
