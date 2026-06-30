@@ -1,3 +1,8 @@
+## 0.2.3
+
+- Relax the `ndk` constraint to `^0.8.4-dev.2` so compatible newer versions
+  resolve.
+
 ## 0.2.2
 
 - Prefix Sembast store names with `nostr_event_scheduler/` to avoid collisions
