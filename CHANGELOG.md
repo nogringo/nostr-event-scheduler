@@ -1,3 +1,8 @@
+## 0.2.2
+
+- Prefix Sembast store names with `nostr_event_scheduler/` to avoid collisions
+  on the host app's shared `Database`. Existing installs resync once.
+
 ## 0.2.1
 
 - Bump package version to `0.2.1`.

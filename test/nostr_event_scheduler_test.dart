@@ -13,7 +13,7 @@ import 'mocks/mock_relay.dart';
 import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
 import 'package:nostr_scheduler_dvm/nostr_scheduler_dvm.dart';
 import 'package:sembast/sembast.dart' as sembast;
-import 'package:sembast/sembast_memory.dart';
+import 'package:sembast/sembast_memory.dart' hide Filter;
 import 'package:test/test.dart';
 
 Future<EventScheduler> createScheduler({
@@ -54,12 +54,35 @@ void main() {
   late Database schedulerDb;
   late EventScheduler scheduler;
 
+  Future<List<Nip01Event>> relayQuery(Filter filter) {
+    return ndk.requests
+        .query(
+          filter: filter,
+          explicitRelays: [relay.url],
+          cacheRead: false,
+          cacheWrite: false,
+        )
+        .future;
+  }
+
   setUp(() async {
     relay = MockRelay(name: 'test relay', explicitPort: 9090);
-    await relay.startServer();
 
     clientKey = Bip340.generatePrivateKey();
     dvmKey = Bip340.generatePrivateKey();
+
+    // Serve NIP-65s so the scheduler can find relays for broadcast
+    final nip65 = Nip65(
+      pubKey: clientKey.publicKey,
+      relays: {relay.url: ReadWriteMarker.readWrite},
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final dvmNip65 = Nip65(
+      pubKey: dvmKey.publicKey,
+      relays: {relay.url: ReadWriteMarker.readOnly},
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    await relay.startServer(nip65s: {clientKey: nip65, dvmKey: dvmNip65});
 
     ndk = Ndk(
       NdkConfig(
@@ -74,29 +97,6 @@ void main() {
       pubkey: clientKey.publicKey,
       privkey: clientKey.privateKey!,
     );
-
-    // Inject a NIP-65 so the scheduler can find relays for broadcast
-    final nip65 = Nip65(
-      pubKey: clientKey.publicKey,
-      relays: {relay.url: ReadWriteMarker.readWrite},
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    );
-    final nip65Event = nip65.toEvent();
-    final signedNip65 = await ndk.accounts.getLoggedAccount()!.signer.sign(
-      nip65Event,
-    );
-    relay.storedEvents.add(signedNip65);
-
-    final dvmNip65 = Nip65(
-      pubKey: dvmKey.publicKey,
-      relays: {relay.url: ReadWriteMarker.readOnly},
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    );
-    final signedDvmNip65 = Nip01Utils.signWithPrivateKey(
-      event: dvmNip65.toEvent(),
-      privateKey: dvmKey.privateKey!,
-    );
-    relay.storedEvents.add(signedDvmNip65);
 
     final dbSuffix =
         '${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(1 << 32)}';
@@ -147,7 +147,9 @@ void main() {
       await Future.delayed(const Duration(milliseconds: 500));
 
       // Verify the kind:5905 was received by the relay
-      final stored = relay.storedEvents.where((e) => e.kind == 5905);
+      final stored = await relayQuery(
+        Filter(kinds: [5905], authors: [clientKey.publicKey]),
+      );
       expect(stored, isNotEmpty);
 
       final requestEvent = stored.first;
@@ -203,10 +205,14 @@ void main() {
 
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final requests = relay.storedEvents.where((e) => e.kind == 5905);
+      final requests = await relayQuery(
+        Filter(kinds: [5905], authors: [clientKey.publicKey]),
+      );
       expect(requests, hasLength(greaterThanOrEqualTo(3)));
 
-      final manifests = relay.storedEvents.where((e) => e.kind == 31234);
+      final manifests = await relayQuery(
+        Filter(kinds: [31234], authors: [clientKey.publicKey]),
+      );
       expect(manifests, isNotEmpty);
       final manifest = manifests.first;
       expect(manifest.getFirstTag('d'), package.packageId);
@@ -262,10 +268,11 @@ void main() {
 
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final request = relay.storedEvents.firstWhere(
-        (event) =>
-            event.kind == 5905 &&
-            event.getFirstTag('p') == fallbackDvmKey.publicKey,
+      final requests = await relayQuery(
+        Filter(kinds: [5905], authors: [clientKey.publicKey]),
+      );
+      final request = requests.firstWhere(
+        (event) => event.getFirstTag('p') == fallbackDvmKey.publicKey,
       );
       expect(request.id, package.requestEventIds.single);
     });
@@ -396,7 +403,9 @@ void main() {
       // Give the shim time to broadcast
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final deletions = relay.storedEvents.where((e) => e.kind == 5);
+      final deletions = await relayQuery(
+        Filter(kinds: [5], authors: [clientKey.publicKey]),
+      );
       expect(deletions, isNotEmpty);
 
       final deletion = deletions.first;
@@ -439,10 +448,11 @@ void main() {
 
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final deletion = relay.storedEvents.singleWhere(
-        (event) =>
-            event.kind == 5 &&
-            event.getTags('e').contains(package.manifestEventId),
+      final deletions = await relayQuery(
+        Filter(kinds: [5], authors: [clientKey.publicKey]),
+      );
+      final deletion = deletions.singleWhere(
+        (event) => event.getTags('e').contains(package.manifestEventId),
       );
       expect(deletion.getTags('e'), containsAll(package.requestEventIds));
       expect(deletion.getTags('e'), contains(package.manifestEventId));
@@ -486,7 +496,9 @@ void main() {
           ),
         ], content: 'cancel even without computed jobs');
 
-        await sembast.stringMapStoreFactory.store('jobs').delete(schedulerDb);
+        await sembast.stringMapStoreFactory
+            .store('nostr_event_scheduler/jobs')
+            .delete(schedulerDb);
 
         expect(await scheduler.listJobs(), isEmpty);
         final packages = await scheduler.listPackages();
@@ -497,10 +509,11 @@ void main() {
 
         await Future.delayed(const Duration(milliseconds: 500));
 
-        final deletion = relay.storedEvents.singleWhere(
-          (event) =>
-              event.kind == 5 &&
-              event.getTags('e').contains(package.manifestEventId),
+        final deletions = await relayQuery(
+          Filter(kinds: [5], authors: [clientKey.publicKey]),
+        );
+        final deletion = deletions.singleWhere(
+          (event) => event.getTags('e').contains(package.manifestEventId),
         );
         expect(deletion.getTags('e'), containsAll(package.requestEventIds));
         expect(deletion.getTags('e'), contains(package.manifestEventId));
@@ -565,7 +578,9 @@ void main() {
         requestEvent,
       );
 
-      relay.storedEvents.add(signedRequest);
+      await ndk.broadcast
+          .broadcast(nostrEvent: signedRequest, specificRelays: [relay.url])
+          .broadcastDoneFuture;
 
       // Start listening and resync
       await scheduler.startListening();
@@ -637,8 +652,7 @@ void main() {
       final updates = <StatusUpdate>[];
       final sub = scheduler.statusUpdates.listen(updates.add);
 
-      // Inject feedback into relay
-      relay.storedEvents.add(signedFeedback);
+      // Push feedback to the live subscription
       relay.sendEvent(
         event: signedFeedback,
         subId: 'scheduler-feedback',

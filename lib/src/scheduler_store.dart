@@ -8,21 +8,28 @@ import 'models/scheduled_package.dart';
 
 /// Internal Sembast store wrapper.
 ///
-/// Manages five stores:
+/// All store names are prefixed with `nostr_event_scheduler/` to avoid
+/// colliding with stores owned by the host app on the shared [Database].
+///
+/// Manages six stores (prefix omitted below):
 /// - `decrypted_payloads`: eventId -> decrypted JSON payload (cache)
 /// - `pending_decryption`: eventId -> true (queue of events waiting for signer)
 /// - `tombstones`: requestEventId -> deletion metadata
 /// - `jobs`: jobId -> ScheduledJob (computed, droppable)
 /// - `packages`: packageId -> ScheduledPackage metadata (computed, droppable)
+/// - `schema_version`: migration metadata
 class SchedulerStore {
   final Database _db;
 
-  static const String _kDecryptedPayloads = 'decrypted_payloads';
-  static const String _kPendingDecryption = 'pending_decryption';
-  static const String _kTombstones = 'tombstones';
-  static const String _kJobs = 'jobs';
-  static const String _kPackages = 'packages';
-  static const String _kSchemaVersion = 'schema_version';
+  static const String _kStorePrefix = 'nostr_event_scheduler/';
+  static const String _kDecryptedPayloads =
+      '${_kStorePrefix}decrypted_payloads';
+  static const String _kPendingDecryption =
+      '${_kStorePrefix}pending_decryption';
+  static const String _kTombstones = '${_kStorePrefix}tombstones';
+  static const String _kJobs = '${_kStorePrefix}jobs';
+  static const String _kPackages = '${_kStorePrefix}packages';
+  static const String _kSchemaVersion = '${_kStorePrefix}schema_version';
   static const int _currentSchemaVersion = 2;
 
   final StoreRef<String, String> _decryptedPayloads;
