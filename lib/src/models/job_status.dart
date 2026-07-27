@@ -16,5 +16,26 @@ enum JobStatus {
   cancelled,
 
   /// The job request was invalid.
-  error,
+  error;
+
+  /// Aggregates the statuses of the requests of one job.
+  ///
+  /// One publication is enough, so the most advanced status wins:
+  /// `published` > `scheduled` > `pending` > `failed` > `error` > `cancelled`.
+  /// Returns null when [statuses] is empty.
+  static JobStatus? aggregate(Iterable<JobStatus> statuses) {
+    const priority = [
+      JobStatus.published,
+      JobStatus.scheduled,
+      JobStatus.pending,
+      JobStatus.failed,
+      JobStatus.error,
+      JobStatus.cancelled,
+    ];
+    final present = statuses.toSet();
+    for (final status in priority) {
+      if (present.contains(status)) return status;
+    }
+    return null;
+  }
 }

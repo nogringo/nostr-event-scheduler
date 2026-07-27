@@ -9,6 +9,7 @@ This package implements the Scheduler DVM protocol and provides a robust, offlin
 - **Local-first** - Every operation is persisted locally before any network attempt
 - **Offline signer support** - Works even when your signer (e.g. NIP-46) is temporarily unavailable
 - **Multi-device sync** - Automatically syncs scheduled jobs across devices
+- **Redundant scheduling** - Send the same job to several Scheduler DVMs (one kind:5905 per DVM, same job_id) so publishing does not depend on a single DVM's uptime or policy
 - **Scheduled packages** - Group several DVM jobs into one logical schedule with private display context
 - **Real-time DVM feedback** - Receives status updates from Scheduler DVMs (`scheduled`, `published`, `failed`, etc.)
 - **No raw event duplication** - Relies on the NDK persistent cache for raw events; only stores decrypted payloads and computed state in Sembast
@@ -63,12 +64,36 @@ Future<void> main() async {
 
   final job = await scheduler.schedule(
     signedEvent,
-    dvmPubkey,
+    [dvmPubkey],
     at: scheduleAt,
     relays: ['wss://relay.damus.io'],
   );
 
   print('Scheduled job: ${job.jobId}');
+
+  // List several DVMs to schedule redundantly: one kind:5905 per DVM, all
+  // sharing the same job_id and payload. One publication is enough, relays
+  // deduplicate the signed event by ID.
+  final signedEventR = await ndk.accounts.getLoggedAccount()!.signer.sign(
+    Nip01Event(
+      pubKey: myPubKey,
+      kind: 1,
+      tags: [],
+      content: 'Published even if one DVM is down',
+      createdAt: scheduleAt.millisecondsSinceEpoch ~/ 1000,
+    ),
+  );
+
+  final redundantJob = await scheduler.schedule(
+    signedEventR,
+    [dvmPubkey, anotherDvmPubkey],
+    at: scheduleAt,
+    relays: ['wss://relay.damus.io'],
+  );
+
+  // One logical job, one request per DVM, aggregated status
+  print('Job ${redundantJob.jobId} via ${redundantJob.dvmPubkeys.length} DVMs');
+  print('Status: ${redundantJob.status}');
 
   // List all jobs
   final jobs = await scheduler.listJobs();
@@ -100,13 +125,14 @@ Future<void> main() async {
     [
       SchedulePackageItem(
         event: signedEventB,
-        dvmPubkey: dvmPubkey,
+        // A package item can also fan out to several DVMs
+        dvmPubkeys: [dvmPubkey, anotherDvmPubkey],
         at: scheduleAt,
         relays: ['wss://relay.damus.io'],
       ),
       SchedulePackageItem(
         event: signedEventC,
-        dvmPubkey: anotherDvmPubkey,
+        dvmPubkeys: [anotherDvmPubkey],
         at: scheduleAt.add(const Duration(minutes: 5)),
         relays: ['wss://nos.lol'],
         dvmReadRelays: ['wss://dvm-inbox.example'],
@@ -145,9 +171,9 @@ The main entry point.
 | `startListening()` | Starts network subscriptions for sync and DVM feedbacks |
 | `stopListening()` | Stops network subscriptions (scheduler remains usable offline) |
 | `resync()` | Forces a manual resync of schedule requests, deletions, and feedbacks |
-| `schedule(event, dvmPubkey, {at, relays, dvmReadRelays})` | Creates a new scheduled job |
+| `schedule(event, dvmPubkeys, {at, relays, dvmReadRelays})` | Creates one scheduled job through one or more DVMs |
 | `schedulePackage(items, {content})` | Creates a logical schedule backed by multiple DVM jobs |
-| `cancel(jobId)` | Cancels a scheduled job by broadcasting a kind:5 deletion |
+| `cancel(jobId)` | Cancels a job (all its DVM requests) with one kind:5 deletion |
 | `cancelPackage(packageId)` | Cancels all jobs in a package and deletes its manifest |
 | `listJobs()` | Lists all scheduled jobs from the local store |
 | `listPackages()` | Lists all scheduled packages from the local store |
@@ -159,12 +185,13 @@ The main entry point.
 
 ### Models
 
-- `ScheduledJob` - Represents a scheduled event with its current status
+- `ScheduledJob` - One logical scheduled event, with one request per DVM and an aggregated status
+- `ScheduledJobRequest` - One kind:5905 request to a single DVM, with the status that DVM reported
 - `SchedulePackageItem` - Input model for one job inside `schedulePackage`
 - `ScheduledPackage` - Represents a package manifest and its linked jobs
 - `ScheduledItem` - Logical schedule item, either a standalone job or a package
-- `JobStatus` - Enum: `pending`, `scheduled`, `published`, `failed`, `cancelled`, `error`
-- `StatusUpdate` - Emitted when a DVM feedback is received
+- `JobStatus` - Enum: `pending`, `scheduled`, `published`, `failed`, `cancelled`, `error`; `JobStatus.aggregate` combines the statuses of one job's requests
+- `StatusUpdate` - Emitted when a DVM feedback is received, with the reporting DVM's pubkey
 - `SyncState` - Tracks whether the local state is up-to-date with the network
 
 ## Architecture

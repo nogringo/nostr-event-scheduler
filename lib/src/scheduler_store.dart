@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:sembast/sembast.dart';
 
@@ -30,7 +31,7 @@ class SchedulerStore {
   static const String _kJobs = '${_kStorePrefix}jobs';
   static const String _kPackages = '${_kStorePrefix}packages';
   static const String _kSchemaVersion = '${_kStorePrefix}schema_version';
-  static const int _currentSchemaVersion = 2;
+  static const int _currentSchemaVersion = 3;
 
   final StoreRef<String, String> _decryptedPayloads;
   final StoreRef<String, bool> _pendingDecryption;
@@ -233,7 +234,7 @@ class SchedulerStore {
         .expand((p) => p.requestEventIds)
         .toSet();
     final standaloneJobs = (await listJobs())
-        .where((job) => !packagedRequestIds.contains(job.requestEventId))
+        .where((job) => !job.requestEventIds.any(packagedRequestIds.contains))
         .map(ScheduledItem.job);
     final items = <ScheduledItem>[
       ...standaloneJobs,
@@ -250,7 +251,9 @@ class SchedulerStore {
   /// Drops and rebuilds computed stores from decrypted payloads and tombstones.
   ///
   /// [buildJob] is a callback that receives (eventId, decryptedPayload)
-  /// and returns a [ScheduledJob] or null if the payload is invalid.
+  /// and returns a single-request [ScheduledJob] or null if the payload is
+  /// invalid. Fragments sharing a job_id are merged into one job, one
+  /// request per kind:5905 event.
   Future<void> rebuildComputed(
     Future<ScheduledJob?> Function(String eventId, String payload) buildJob, {
     Future<ScheduledPackage?> Function(String eventId, String payload)?
@@ -264,9 +267,20 @@ class SchedulerStore {
       final eventId = record.key;
       final payload = record.value;
       final job = await buildJob(eventId, payload);
-      if (job != null) {
+      if (job == null) continue;
+
+      final existing = await getJob(job.jobId);
+      if (existing == null) {
         await putJob(job);
+        continue;
       }
+      for (final request in job.requests) {
+        if (existing.requestForEventId(request.requestEventId) == null) {
+          existing.requests.add(request);
+        }
+      }
+      existing.updatedAt = max(existing.updatedAt, job.updatedAt);
+      await putJob(existing);
     }
 
     if (buildPackage != null) {
@@ -288,6 +302,6 @@ class SchedulerStore {
   ) async {
     final ids = requestEventIds.toSet();
     final jobs = await listJobs();
-    return jobs.where((job) => ids.contains(job.requestEventId)).toList();
+    return jobs.where((job) => job.requestEventIds.any(ids.contains)).toList();
   }
 }

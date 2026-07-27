@@ -5,7 +5,13 @@ class StatusUpdate {
   /// The stable job identifier.
   final String jobId;
 
-  /// The new status reported by the DVM.
+  /// Public key of the Scheduler DVM that reported this status.
+  final String dvmPubkey;
+
+  /// The new status reported by the DVM for its request.
+  ///
+  /// The job-level status is [ScheduledJob.status], aggregated across all
+  /// the job's requests.
   final JobStatus status;
 
   /// Optional human-readable message from the DVM.
@@ -16,6 +22,7 @@ class StatusUpdate {
 
   StatusUpdate({
     required this.jobId,
+    required this.dvmPubkey,
     required this.status,
     this.message,
     required this.receivedAt,

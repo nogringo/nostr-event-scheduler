@@ -10,6 +10,7 @@ import 'models/job_status.dart';
 import 'models/schedule_package_item.dart';
 import 'models/scheduled_item.dart';
 import 'models/scheduled_job.dart';
+import 'models/scheduled_job_request.dart';
 import 'models/scheduled_package.dart';
 import 'models/status_update.dart';
 import 'models/sync_state.dart';
@@ -210,37 +211,46 @@ class EventScheduler {
   // CRUD
   // --------------------------------------------------------------------------
 
-  /// Schedules an event to be published later by a Scheduler DVM.
+  /// Schedules an event to be published later by one or more Scheduler DVMs.
   ///
-  /// [relays] specifies where the DVM should publish (payload). If omitted,
+  /// Every DVM in [dvmPubkeys] receives its own kind:5905 request carrying
+  /// the same job_id and payload, so publishing does not depend on a single
+  /// DVM's uptime or policy. Publication stays deterministic because all
+  /// DVMs publish the same already-signed [event]; relays deduplicate it by
+  /// ID.
+  ///
+  /// [relays] specifies where the DVMs should publish (payload). If omitted,
   /// falls back to the user's NIP-65 write relays.
   ///
-  /// The kind:5905 request is broadcast via the [OfflineBroadcast] shim to
-  /// all the user's NIP-65 relays (read + write).
+  /// The kind:5905 requests are broadcast via the [OfflineBroadcast] shim to
+  /// all the user's NIP-65 relays (read + write) plus each DVM's read relays.
   Future<ScheduledJob> schedule(
     Nip01Event event,
-    String dvmPubkey, {
+    List<String> dvmPubkeys, {
     DateTime? at,
     List<String>? relays,
     List<String>? dvmReadRelays,
   }) async {
-    final signer = _ndk.accounts.getLoggedAccount()?.signer;
-    if (signer == null) throw StateError('No logged in account');
-
-    final result = await _createScheduleRequest(
+    final created = await _createJob(
       event,
-      dvmPubkey,
+      dvmPubkeys,
       at: at,
       relays: relays,
       dvmReadRelays: dvmReadRelays,
     );
 
-    await _broadcast.broadcast(result.requestEvent, relays: result.relays);
-    await _store.putDecryptedPayload(result.requestEvent.id, result.payload);
-    await _store.putJob(result.job);
+    for (final request in created.requests) {
+      await _store.putDecryptedPayload(request.event.id, created.payload);
+    }
+    await _store.putJob(created.job);
+
+    await Future.wait([
+      for (final request in created.requests)
+        _broadcast.broadcast(request.event, relays: request.broadcastRelays),
+    ]);
     _scheduleFeedbackSubscriptionUpdate();
 
-    return result.job;
+    return created.job;
   }
 
   /// Schedules multiple events as one logical package.
@@ -255,18 +265,19 @@ class EventScheduler {
     final signer = _ndk.accounts.getLoggedAccount()?.signer;
     if (signer == null) throw StateError('No logged in account');
 
-    final created = <_CreatedScheduleRequest>[];
+    final created = <_CreatedJob>[];
     for (final item in items) {
       created.add(
-        await _createScheduleRequest(
+        await _createJob(
           item.event,
-          item.dvmPubkey,
+          item.dvmPubkeys,
           at: item.at,
           relays: item.relays,
           dvmReadRelays: item.dvmReadRelays,
         ),
       );
     }
+    final requestEvents = created.expand((job) => job.requests).toList();
 
     final packageId = _generateJobId();
     final encrypted = await signer.encryptNip44(
@@ -283,7 +294,7 @@ class EventScheduler {
       tags: [
         ['d', packageId],
         ['k', '5905'],
-        ...created.map((result) => ['e', result.requestEvent.id]),
+        ...requestEvents.map((request) => ['e', request.event.id]),
       ],
       content: encrypted,
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
@@ -296,22 +307,26 @@ class EventScheduler {
       packageId: packageId,
       manifestEventId: signedManifest.id,
       content: content,
-      requestEventIds: created.map((result) => result.requestEvent.id).toList(),
+      requestEventIds: requestEvents
+          .map((request) => request.event.id)
+          .toList(),
       jobs: created.map((result) => result.job).toList(),
       createdAt: now,
       updatedAt: now,
     );
 
     for (final result in created) {
-      await _store.putDecryptedPayload(result.requestEvent.id, result.payload);
+      for (final request in result.requests) {
+        await _store.putDecryptedPayload(request.event.id, result.payload);
+      }
       await _store.putJob(result.job);
     }
     await _store.putDecryptedPayload(signedManifest.id, content);
     await _store.putPackage(package);
 
     await Future.wait([
-      for (final result in created)
-        _broadcast.broadcast(result.requestEvent, relays: result.relays),
+      for (final request in requestEvents)
+        _broadcast.broadcast(request.event, relays: request.broadcastRelays),
       _broadcast.broadcast(signedManifest, relays: userRelays),
     ]);
 
@@ -321,6 +336,9 @@ class EventScheduler {
   }
 
   /// Cancels a scheduled job by broadcasting a kind:5 deletion event.
+  ///
+  /// One deletion tags every kind:5905 request of the job, so all its DVMs
+  /// are cancelled at once.
   Future<void> cancel(String jobId) async {
     final signer = _ndk.accounts.getLoggedAccount()?.signer;
     if (signer == null) throw StateError('No logged in account');
@@ -333,7 +351,7 @@ class EventScheduler {
       pubKey: signer.getPublicKey(),
       kind: 5,
       tags: [
-        ['e', job.requestEventId],
+        for (final requestEventId in job.requestEventIds) ['e', requestEventId],
         ['k', '5905'],
       ],
       content: 'cancel',
@@ -341,16 +359,18 @@ class EventScheduler {
     );
     final signedDeletion = await signer.sign(deletionEvent);
 
-    final broadcastRelays = await _deletionBroadcastRelays(job.dvmPubkey);
+    final broadcastRelays = await _deletionRelaysForDvms(job.dvmPubkeys);
 
     // Broadcast via shim
     await _broadcast.broadcast(signedDeletion, relays: broadcastRelays);
 
     // Update local state
-    await _store.putTombstone(
-      job.requestEventId,
-      deletionEventId: signedDeletion.id,
-    );
+    for (final requestEventId in job.requestEventIds) {
+      await _store.putTombstone(
+        requestEventId,
+        deletionEventId: signedDeletion.id,
+      );
+    }
     await _store.removeJob(job.jobId);
   }
 
@@ -386,10 +406,7 @@ class EventScheduler {
         requestEventId,
         deletionEventId: signedDeletion.id,
       );
-      final job = await _jobByRequestEventId(requestEventId);
-      if (job != null) {
-        await _store.removeJob(job.jobId);
-      }
+      await _removeRequestFromJobs(requestEventId);
     }
     await _store.putTombstone(
       package.manifestEventId,
@@ -463,7 +480,6 @@ class EventScheduler {
     // kind:5905 subscription
     final scheduleResponse = _ndk.requests.subscription(
       filter: Filter(authors: [pubkey], kinds: [5905]),
-      id: 'scheduler-sync-5905',
     );
     _syncResponses.add(scheduleResponse);
     _syncSubscriptions.add(scheduleResponse.stream.listen(_onScheduleEvent));
@@ -471,17 +487,13 @@ class EventScheduler {
     // kind:31234 package manifest subscription
     final packageResponse = _ndk.requests.subscription(
       filter: Filter(authors: [pubkey], kinds: [31234]),
-      id: 'scheduler-sync-31234',
     );
     _syncResponses.add(packageResponse);
     _syncSubscriptions.add(packageResponse.stream.listen(_onPackageEvent));
 
     // kind:5 subscription (deletions of jobs and package manifests)
     final deletionFilter = Filter(authors: [pubkey], kinds: [5]);
-    final deletionResponse = _ndk.requests.subscription(
-      filter: deletionFilter,
-      id: 'scheduler-sync-5',
-    );
+    final deletionResponse = _ndk.requests.subscription(filter: deletionFilter);
     _syncResponses.add(deletionResponse);
     _syncSubscriptions.add(deletionResponse.stream.listen(_onDeletionEvent));
   }
@@ -600,14 +612,23 @@ class EventScheduler {
     final deletedEventIds = event.getTags('e');
     for (final requestEventId in deletedEventIds) {
       await _store.putTombstone(requestEventId, deletionEventId: event.id);
-      final jobs = await _store.listJobs();
-      final job = jobs
-          .where((j) => j.requestEventId == requestEventId)
-          .firstOrNull;
-      if (job != null) {
-        await _store.removeJob(job.jobId);
-      }
+      await _removeRequestFromJobs(requestEventId);
       await _store.removePackageByManifestEventId(requestEventId);
+    }
+  }
+
+  /// Removes the request identified by [requestEventId] from its job.
+  /// The job itself is removed once its last request is gone.
+  Future<void> _removeRequestFromJobs(String requestEventId) async {
+    final job = await _jobByRequestEventId(requestEventId);
+    if (job == null) return;
+
+    job.requests.removeWhere((r) => r.requestEventId == requestEventId);
+    if (job.requests.isEmpty) {
+      await _store.removeJob(job.jobId);
+    } else {
+      job.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      await _store.putJob(job);
     }
   }
 
@@ -677,19 +698,34 @@ class EventScheduler {
       }
 
       final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final job = ScheduledJob(
-        jobId: jobId,
-        requestEventId: event.id,
+      final request = ScheduledJobRequest(
         dvmPubkey: dvmPubkey,
-        scheduleAt: scheduleAt,
-        targetEvent: targetEvent,
-        targetRelays: targetRelays,
-        status: JobStatus.pending,
-        createdAt: now,
+        requestEventId: event.id,
         updatedAt: now,
       );
 
+      // Requests sharing a job_id schedule the same event: merge them.
+      final existing = await _store.getJob(jobId);
+      ScheduledJob job;
+      if (existing != null) {
+        if (existing.requestForEventId(event.id) != null) return;
+        existing.requests.add(request);
+        existing.updatedAt = now;
+        job = existing;
+      } else {
+        job = ScheduledJob(
+          jobId: jobId,
+          scheduleAt: scheduleAt,
+          targetEvent: targetEvent,
+          targetRelays: targetRelays,
+          requests: [request],
+          createdAt: now,
+          updatedAt: now,
+        );
+      }
+
       await _store.putJob(job);
+      await _applyCachedFeedbacks(job);
     } catch (_) {
       // Invalid payload, ignore
     }
@@ -710,7 +746,7 @@ class EventScheduler {
 
       final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final jobs = (await _store.listJobs())
-          .where((job) => requestEventIds.contains(job.requestEventId))
+          .where((job) => job.requestEventIds.any(requestEventIds.contains))
           .toList();
 
       await _store.putPackage(
@@ -729,7 +765,11 @@ class EventScheduler {
     }
   }
 
-  Future<void> _processFeedbackPayload(Nip01Event event, String payload) async {
+  Future<void> _processFeedbackPayload(
+    Nip01Event event,
+    String payload, {
+    bool notify = true,
+  }) async {
     try {
       final json = jsonDecode(payload) as Map<String, dynamic>;
       final statusStr = json['status'] as String;
@@ -741,21 +781,52 @@ class EventScheduler {
       final job = await _store.getJob(jobId);
       if (job == null) return;
 
-      job.status = status;
-      job.lastMessage = message;
-      job.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      // The kind:7000 is signed by the DVM, so its pubkey attributes the
+      // feedback to one of the job's requests.
+      final request = job.requestForDvm(event.pubKey);
+      if (request == null) return;
+
+      request.status = status;
+      request.lastMessage = message;
+      request.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      job.updatedAt = request.updatedAt;
       await _store.putJob(job);
 
-      _statusController.add(
-        StatusUpdate(
-          jobId: jobId,
-          status: status,
-          message: message,
-          receivedAt: DateTime.now(),
-        ),
-      );
+      if (notify) {
+        _statusController.add(
+          StatusUpdate(
+            jobId: jobId,
+            dvmPubkey: event.pubKey,
+            status: status,
+            message: message,
+            receivedAt: DateTime.now(),
+          ),
+        );
+      }
     } catch (_) {
       // Invalid payload, ignore
+    }
+  }
+
+  /// Applies feedbacks already sitting in the NDK cache to [job].
+  ///
+  /// Covers requests learned after their feedback (multi-device sync or
+  /// rebuild). Feedbacks are applied oldest first so every request converges
+  /// to its latest known status.
+  Future<void> _applyCachedFeedbacks(ScheduledJob job) async {
+    final feedbacks = await _ndk.config.cache.loadEvents(
+      kinds: [7000],
+      tags: {
+        'r': [job.jobId],
+      },
+    );
+    if (feedbacks.isEmpty) return;
+
+    feedbacks.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final feedback in feedbacks) {
+      final decrypted = await _store.getDecryptedPayload(feedback.id);
+      if (decrypted == null) continue;
+      await _processFeedbackPayload(feedback, decrypted, notify: false);
     }
   }
 
@@ -787,10 +858,7 @@ class EventScheduler {
     final filter = Filter(kinds: [7000]);
     filter.setTag('r', jobIds);
 
-    final response = _ndk.requests.subscription(
-      filter: filter,
-      id: 'scheduler-feedback',
-    );
+    final response = _ndk.requests.subscription(filter: filter);
     _feedbackRequestId = response.requestId;
     _feedbackSubscription = response.stream.listen(_onFeedbackEvent);
   }
@@ -832,25 +900,29 @@ class EventScheduler {
           // For rebuild, we don't know the dvmPubkey from the payload alone.
           // We try to fetch the kind:5905 event from NDK cache to get the p tag.
           String dvmPubkey = '';
-          final response = _ndk.requests.query(
-            filter: Filter(ids: [eventId], kinds: [5905]),
-            cacheRead: true,
-            cacheWrite: false,
+          final events = await _ndk.config.cache.loadEvents(
+            ids: [eventId],
+            kinds: [5905],
           );
-          final events = await response.future;
           if (events.isNotEmpty) {
             dvmPubkey = events.first.getFirstTag('p') ?? '';
           }
 
+          // One single-request job per payload; the store merges the
+          // fragments that share a job_id.
           final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
           return ScheduledJob(
             jobId: jobId,
-            requestEventId: eventId,
-            dvmPubkey: dvmPubkey,
             scheduleAt: scheduleAt,
             targetEvent: targetEvent,
             targetRelays: targetRelays,
-            status: JobStatus.pending,
+            requests: [
+              ScheduledJobRequest(
+                dvmPubkey: dvmPubkey,
+                requestEventId: eventId,
+                updatedAt: now,
+              ),
+            ],
             createdAt: now,
             updatedAt: now,
           );
@@ -862,12 +934,10 @@ class EventScheduler {
         try {
           if (await _store.isTombstoned(eventId)) return null;
 
-          final response = _ndk.requests.query(
-            filter: Filter(ids: [eventId], kinds: [31234]),
-            cacheRead: true,
-            cacheWrite: false,
+          final events = await _ndk.config.cache.loadEvents(
+            ids: [eventId],
+            kinds: [31234],
           );
-          final events = await response.future;
           if (events.isEmpty) return null;
 
           final event = events.first;
@@ -880,7 +950,7 @@ class EventScheduler {
 
           final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
           final jobs = (await _store.listJobs())
-              .where((job) => requestEventIds.contains(job.requestEventId))
+              .where((job) => job.requestEventIds.any(requestEventIds.contains))
               .toList();
 
           return ScheduledPackage(
@@ -901,22 +971,7 @@ class EventScheduler {
     // Apply feedbacks from cache
     final jobs = await _store.listJobs();
     for (final job in jobs) {
-      final feedbackResponse = _ndk.requests.query(
-        filter: Filter(kinds: [7000])..setTag('r', [job.jobId]),
-        cacheRead: true,
-        cacheWrite: false,
-      );
-      final feedbacks = await feedbackResponse.future;
-      if (feedbacks.isEmpty) continue;
-
-      // Sort by created_at desc to get latest feedback
-      feedbacks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-      final latest = feedbacks.first;
-
-      final decrypted = await _store.getDecryptedPayload(latest.id);
-      if (decrypted != null) {
-        await _processFeedbackPayload(latest, decrypted);
-      }
+      await _applyCachedFeedbacks(job);
     }
   }
 
@@ -924,15 +979,22 @@ class EventScheduler {
   // Helpers
   // --------------------------------------------------------------------------
 
-  Future<_CreatedScheduleRequest> _createScheduleRequest(
+  /// Creates one job for [dvmPubkeys]: a single job_id and payload, one
+  /// signed kind:5905 request per DVM.
+  Future<_CreatedJob> _createJob(
     Nip01Event event,
-    String dvmPubkey, {
+    List<String> dvmPubkeys, {
     DateTime? at,
     List<String>? relays,
     List<String>? dvmReadRelays,
   }) async {
     final signer = _ndk.accounts.getLoggedAccount()?.signer;
     if (signer == null) throw StateError('No logged in account');
+
+    final dvms = {...dvmPubkeys}.toList();
+    if (dvms.isEmpty) {
+      throw ArgumentError('At least one DVM pubkey is required');
+    }
 
     final jobId = _generateJobId();
     final scheduleAt =
@@ -952,43 +1014,55 @@ class EventScheduler {
       'relays': targetRelays,
     });
 
-    final encrypted = await signer.encryptNip44(
-      plaintext: payload,
-      recipientPubKey: dvmPubkey,
-    );
-    if (encrypted == null) throw StateError('Failed to encrypt payload');
-
-    final requestEvent = Nip01Event(
-      pubKey: signer.getPublicKey(),
-      kind: 5905,
-      tags: [
-        ['p', dvmPubkey],
-        ['encrypted'],
-      ],
-      content: encrypted,
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    );
-    final signedRequestEvent = await signer.sign(requestEvent);
-
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final requests = <_CreatedJobRequest>[];
+    for (final dvmPubkey in dvms) {
+      final encrypted = await signer.encryptNip44(
+        plaintext: payload,
+        recipientPubKey: dvmPubkey,
+      );
+      if (encrypted == null) throw StateError('Failed to encrypt payload');
+
+      final requestEvent = Nip01Event(
+        pubKey: signer.getPublicKey(),
+        kind: 5905,
+        tags: [
+          ['p', dvmPubkey],
+          ['encrypted'],
+        ],
+        content: encrypted,
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      requests.add(
+        _CreatedJobRequest(
+          dvmPubkey: dvmPubkey,
+          event: await signer.sign(requestEvent),
+          broadcastRelays: await _requestBroadcastRelays(
+            dvmPubkey,
+            dvmReadRelays,
+          ),
+        ),
+      );
+    }
+
     final job = ScheduledJob(
       jobId: jobId,
-      requestEventId: signedRequestEvent.id,
-      dvmPubkey: dvmPubkey,
       scheduleAt: scheduleAt,
       targetEvent: event,
       targetRelays: targetRelays,
-      status: JobStatus.pending,
+      requests: [
+        for (final request in requests)
+          ScheduledJobRequest(
+            dvmPubkey: request.dvmPubkey,
+            requestEventId: request.event.id,
+            updatedAt: now,
+          ),
+      ],
       createdAt: now,
       updatedAt: now,
     );
 
-    return _CreatedScheduleRequest(
-      job: job,
-      requestEvent: signedRequestEvent,
-      payload: payload,
-      relays: await _requestBroadcastRelays(dvmPubkey, dvmReadRelays),
-    );
+    return _CreatedJob(job: job, requests: requests, payload: payload);
   }
 
   Future<List<String>> _targetRelays(List<String>? relays) async {
@@ -1025,33 +1099,38 @@ class EventScheduler {
     return {...userRelays, ...dvmRelays}.toList();
   }
 
-  Future<List<String>> _deletionBroadcastRelays(String dvmPubkey) async {
-    final userRelays = await _userBroadcastRelays();
-    final dvmRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
-      dvmPubkey,
-    );
-    return {...userRelays, ...?dvmRelayList?.readUrls}.toList();
+  Future<List<String>> _deletionRelaysForDvms(
+    Iterable<String> dvmPubkeys,
+  ) async {
+    final relays = {...await _userBroadcastRelays()};
+    for (final dvmPubkey in {...dvmPubkeys}) {
+      if (dvmPubkey.isEmpty) continue;
+      final dvmRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
+        dvmPubkey,
+      );
+      relays.addAll(dvmRelayList?.readUrls ?? const []);
+    }
+    return relays.toList();
   }
 
   Future<ScheduledJob?> _jobByRequestEventId(String requestEventId) async {
     final jobs = await _store.listJobs();
     return jobs
-        .where((job) => job.requestEventId == requestEventId)
+        .where((job) => job.requestForEventId(requestEventId) != null)
         .firstOrNull;
   }
 
   Future<String?> _dvmPubkeyForRequestEventId(String requestEventId) async {
     final job = await _jobByRequestEventId(requestEventId);
-    if (job != null && job.dvmPubkey.isNotEmpty) {
-      return job.dvmPubkey;
+    final dvmPubkey = job?.requestForEventId(requestEventId)?.dvmPubkey;
+    if (dvmPubkey != null && dvmPubkey.isNotEmpty) {
+      return dvmPubkey;
     }
 
-    final response = _ndk.requests.query(
-      filter: Filter(ids: [requestEventId], kinds: [5905]),
-      cacheRead: true,
-      cacheWrite: false,
+    final events = await _ndk.config.cache.loadEvents(
+      ids: [requestEventId],
+      kinds: [5905],
     );
-    final events = await response.future;
     if (events.isEmpty) return null;
     return events.first.getFirstTag('p');
   }
@@ -1059,16 +1138,13 @@ class EventScheduler {
   Future<List<String>> _packageDeletionBroadcastRelays(
     Iterable<String> requestEventIds,
   ) async {
-    final relays = {...await _userBroadcastRelays()};
+    final dvmPubkeys = <String>{};
     for (final requestEventId in requestEventIds) {
       final dvmPubkey = await _dvmPubkeyForRequestEventId(requestEventId);
       if (dvmPubkey == null || dvmPubkey.isEmpty) continue;
-      final dvmRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
-        dvmPubkey,
-      );
-      relays.addAll(dvmRelayList?.readUrls ?? const []);
+      dvmPubkeys.add(dvmPubkey);
     }
-    return relays.toList();
+    return _deletionRelaysForDvms(dvmPubkeys);
   }
 
   Future<List<String>> _userBroadcastRelays() async {
@@ -1104,16 +1180,26 @@ class EventScheduler {
   }
 }
 
-class _CreatedScheduleRequest {
+class _CreatedJob {
   final ScheduledJob job;
-  final Nip01Event requestEvent;
+  final List<_CreatedJobRequest> requests;
   final String payload;
-  final List<String> relays;
 
-  _CreatedScheduleRequest({
+  _CreatedJob({
     required this.job,
-    required this.requestEvent,
+    required this.requests,
     required this.payload,
-    required this.relays,
+  });
+}
+
+class _CreatedJobRequest {
+  final String dvmPubkey;
+  final Nip01Event event;
+  final List<String> broadcastRelays;
+
+  _CreatedJobRequest({
+    required this.dvmPubkey,
+    required this.event,
+    required this.broadcastRelays,
   });
 }

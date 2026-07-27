@@ -49,6 +49,7 @@ void main() {
   late MockRelay relay;
   late KeyPair clientKey;
   late KeyPair dvmKey;
+  late KeyPair dvm2Key;
   late Ndk ndk;
   late Database broadcastDb;
   late Database schedulerDb;
@@ -65,11 +66,44 @@ void main() {
         .future;
   }
 
+  Future<void> publishFeedback({
+    required KeyPair dvm,
+    required String jobId,
+    required String status,
+    String? message,
+  }) async {
+    final ephemeralKey = Bip340.generatePrivateKey();
+    final payload = jsonEncode({'status': status, 'message': ?message});
+    final encrypted = await Nip44.encryptMessage(
+      payload,
+      ephemeralKey.privateKey!,
+      clientKey.publicKey,
+    );
+    final feedbackEvent = Nip01Event(
+      pubKey: dvm.publicKey,
+      kind: 7000,
+      tags: [
+        ['r', jobId],
+        ['ephemeral-pubkey', ephemeralKey.publicKey],
+      ],
+      content: encrypted,
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final signedFeedback = Nip01Utils.signWithPrivateKey(
+      event: feedbackEvent,
+      privateKey: dvm.privateKey!,
+    );
+    await ndk.broadcast
+        .broadcast(nostrEvent: signedFeedback, specificRelays: [relay.url])
+        .broadcastDoneFuture;
+  }
+
   setUp(() async {
     relay = MockRelay(name: 'test relay', explicitPort: 9090);
 
     clientKey = Bip340.generatePrivateKey();
     dvmKey = Bip340.generatePrivateKey();
+    dvm2Key = Bip340.generatePrivateKey();
 
     // Serve NIP-65s so the scheduler can find relays for broadcast
     final nip65 = Nip65(
@@ -82,13 +116,19 @@ void main() {
       relays: {relay.url: ReadWriteMarker.readOnly},
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
-    await relay.startServer(nip65s: {clientKey: nip65, dvmKey: dvmNip65});
+    final dvm2Nip65 = Nip65(
+      pubKey: dvm2Key.publicKey,
+      relays: {relay.url: ReadWriteMarker.readOnly},
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    await relay.startServer(
+      nip65s: {clientKey: nip65, dvmKey: dvmNip65, dvm2Key: dvm2Nip65},
+    );
 
     ndk = Ndk(
       NdkConfig(
         eventVerifier: Bip340EventVerifier(),
         cache: MemCacheManager(),
-        engine: NdkEngine.RELAY_SETS,
         bootstrapRelays: [relay.url],
         fetchedRangesEnabled: true,
       ),
@@ -136,7 +176,7 @@ void main() {
 
       final job = await scheduler.schedule(
         signedEvent,
-        dvmKey.publicKey,
+        [dvmKey.publicKey],
         relays: [relay.url],
       );
 
@@ -155,6 +195,226 @@ void main() {
       final requestEvent = stored.first;
       expect(requestEvent.pubKey, clientKey.publicKey);
       expect(requestEvent.getFirstTag('p'), dvmKey.publicKey);
+    });
+  });
+
+  group('redundant scheduling', () {
+    test('broadcasts one kind:5905 per DVM sharing one job_id', () async {
+      final event = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'redundant hello',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        event,
+      );
+
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey, dvm2Key.publicKey],
+        relays: [relay.url],
+      );
+
+      expect(job.requests, hasLength(2));
+      expect(
+        job.dvmPubkeys,
+        containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
+      );
+      expect(job.status, JobStatus.pending);
+      expect(await scheduler.listJobs(), hasLength(1));
+      expect(await scheduler.listSchedules(), hasLength(1));
+
+      // Give the shim time to broadcast
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final stored = await relayQuery(
+        Filter(kinds: [5905], authors: [clientKey.publicKey]),
+      );
+      expect(stored, hasLength(2));
+
+      final byDvm = {for (final event in stored) event.getFirstTag('p'): event};
+      expect(byDvm.keys, containsAll([dvmKey.publicKey, dvm2Key.publicKey]));
+
+      // Every DVM receives the exact same payload, job_id included
+      final payloadA = await Nip44.decryptMessage(
+        byDvm[dvmKey.publicKey]!.content,
+        dvmKey.privateKey!,
+        clientKey.publicKey,
+      );
+      final payloadB = await Nip44.decryptMessage(
+        byDvm[dvm2Key.publicKey]!.content,
+        dvm2Key.privateKey!,
+        clientKey.publicKey,
+      );
+      expect(payloadA, payloadB);
+
+      final decoded = jsonDecode(payloadA) as Map<String, dynamic>;
+      expect(decoded['job_id'], job.jobId);
+      final signedEventMap = decoded['signed_event'] as Map<String, dynamic>;
+      expect(signedEventMap['id'], signedEvent.id);
+    });
+
+    test('aggregates per-DVM feedback statuses', () async {
+      final event = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'aggregate test',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        event,
+      );
+
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey, dvm2Key.publicKey],
+        relays: [relay.url],
+      );
+
+      await scheduler.startListening();
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final updates = <StatusUpdate>[];
+      final sub = scheduler.statusUpdates.listen(updates.add);
+
+      // First DVM fails: the other one is still pending, so the job is too
+      await publishFeedback(dvm: dvmKey, jobId: job.jobId, status: 'failed');
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs();
+        return jobs.single.requestForDvm(dvmKey.publicKey)!.status ==
+            JobStatus.failed;
+      });
+      var current = (await scheduler.listJobs()).single;
+      expect(current.status, JobStatus.pending);
+
+      // Second DVM accepts: one acceptance is enough
+      await publishFeedback(
+        dvm: dvm2Key,
+        jobId: job.jobId,
+        status: 'scheduled',
+      );
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs();
+        return jobs.single.requestForDvm(dvm2Key.publicKey)!.status ==
+            JobStatus.scheduled;
+      });
+      current = (await scheduler.listJobs()).single;
+      expect(current.status, JobStatus.scheduled);
+
+      await sub.cancel();
+
+      expect(
+        updates.map((update) => update.dvmPubkey),
+        containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
+      );
+    });
+
+    test('cancel tags every kind:5905 request in one kind:5', () async {
+      final event = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'cancel redundant',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        event,
+      );
+
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey, dvm2Key.publicKey],
+        relays: [relay.url],
+      );
+      expect(job.requestEventIds, hasLength(2));
+
+      await scheduler.cancel(job.jobId);
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final deletions = await relayQuery(
+        Filter(kinds: [5], authors: [clientKey.publicKey]),
+      );
+      expect(deletions, hasLength(1));
+      expect(deletions.single.getTags('e'), containsAll(job.requestEventIds));
+      expect(await scheduler.listJobs(), isEmpty);
+    });
+
+    test('merges kind:5905 requests sharing a job_id from the relay', () async {
+      final targetEvent = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'merge sync test',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedTarget = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        targetEvent,
+      );
+
+      final jobId = List.generate(
+        32,
+        (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0'),
+      ).join();
+
+      final payload = jsonEncode({
+        'job_id': jobId,
+        'schedule_at': signedTarget.createdAt,
+        'signed_event': {
+          'id': signedTarget.id,
+          'pubkey': signedTarget.pubKey,
+          'created_at': signedTarget.createdAt,
+          'kind': signedTarget.kind,
+          'tags': signedTarget.tags,
+          'content': signedTarget.content,
+          'sig': signedTarget.sig,
+        },
+        'relays': [relay.url],
+      });
+
+      for (final dvm in [dvmKey, dvm2Key]) {
+        final encrypted = await Nip44.encryptMessage(
+          payload,
+          clientKey.privateKey!,
+          dvm.publicKey,
+        );
+        final requestEvent = Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 5905,
+          tags: [
+            ['p', dvm.publicKey],
+            ['encrypted'],
+          ],
+          content: encrypted,
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        );
+        final signedRequest = await ndk.accounts
+            .getLoggedAccount()!
+            .signer
+            .sign(requestEvent);
+        await ndk.broadcast
+            .broadcast(nostrEvent: signedRequest, specificRelays: [relay.url])
+            .broadcastDoneFuture;
+      }
+
+      await scheduler.startListening();
+      await scheduler.resync();
+
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs();
+        return jobs.length == 1 && jobs.single.requests.length == 2;
+      });
+
+      final job = (await scheduler.listJobs()).single;
+      expect(job.jobId, jobId);
+      expect(
+        job.dvmPubkeys,
+        containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
+      );
+      expect(await scheduler.listSchedules(), hasLength(1));
     });
   });
 
@@ -186,16 +446,20 @@ void main() {
       final signedB = await signer.sign(eventB);
       final signedC = await signer.sign(eventC);
 
-      await scheduler.schedule(signedA, dvmKey.publicKey, relays: [relay.url]);
+      await scheduler.schedule(
+        signedA,
+        [dvmKey.publicKey],
+        relays: [relay.url],
+      );
       final package = await scheduler.schedulePackage([
         SchedulePackageItem(
           event: signedB,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           relays: [relay.url],
         ),
         SchedulePackageItem(
           event: signedC,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           relays: [relay.url],
         ),
       ], content: 'opaque display context');
@@ -258,13 +522,13 @@ void main() {
       final package = await scheduler.schedulePackage([
         SchedulePackageItem(
           event: signedEvent,
-          dvmPubkey: fallbackDvmKey.publicKey,
+          dvmPubkeys: [fallbackDvmKey.publicKey],
           relays: [relay.url],
           dvmReadRelays: [relay.url],
         ),
       ], content: 'fallback context');
 
-      expect(package.jobs.single.dvmPubkey, fallbackDvmKey.publicKey);
+      expect(package.jobs.single.dvmPubkeys, [fallbackDvmKey.publicKey]);
 
       await Future.delayed(const Duration(milliseconds: 500));
 
@@ -277,12 +541,76 @@ void main() {
       expect(request.id, package.requestEventIds.single);
     });
 
+    test('fans out package items to multiple DVMs', () async {
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final signedB = await signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'redundant package B',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+      final signedC = await signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'redundant package C',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+
+      final package = await scheduler.schedulePackage([
+        SchedulePackageItem(
+          event: signedB,
+          dvmPubkeys: [dvmKey.publicKey, dvm2Key.publicKey],
+          relays: [relay.url],
+        ),
+        SchedulePackageItem(
+          event: signedC,
+          dvmPubkeys: [dvmKey.publicKey],
+          relays: [relay.url],
+        ),
+      ], content: 'redundant package context');
+
+      expect(package.jobs, hasLength(2));
+      expect(package.requestEventIds, hasLength(3));
+      final redundantJob = package.jobs.firstWhere(
+        (job) => job.targetEvent.id == signedB.id,
+      );
+      expect(
+        redundantJob.dvmPubkeys,
+        containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
+      );
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final manifests = await relayQuery(
+        Filter(kinds: [31234], authors: [clientKey.publicKey]),
+      );
+      expect(
+        manifests.single.getTags('e'),
+        containsAll(package.requestEventIds),
+      );
+
+      final requests = await relayQuery(
+        Filter(kinds: [5905], authors: [clientKey.publicKey]),
+      );
+      expect(requests, hasLength(3));
+
+      // The package stays one logical schedule
+      final schedules = await scheduler.listSchedules();
+      expect(schedules, hasLength(1));
+      expect(schedules.single.type, ScheduledItemType.package);
+    });
+
     test('is accepted by a real scheduler DVM implementation', () async {
       final dvmNdk = Ndk(
         NdkConfig(
           eventVerifier: Bip340EventVerifier(useIsolate: false),
           cache: MemCacheManager(),
-          engine: NdkEngine.RELAY_SETS,
           bootstrapRelays: [relay.url],
           fetchedRangesEnabled: true,
           defaultQueryTimeout: const Duration(seconds: 2),
@@ -338,13 +666,13 @@ void main() {
       final package = await scheduler.schedulePackage([
         SchedulePackageItem(
           event: eventB,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           at: DateTime.now().add(const Duration(minutes: 1)),
           relays: [relay.url],
         ),
         SchedulePackageItem(
           event: eventC,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           at: DateTime.now().add(const Duration(minutes: 1)),
           relays: [relay.url],
         ),
@@ -377,6 +705,97 @@ void main() {
         everyElement(JobStatus.scheduled),
       );
     });
+
+    test('redundant job is accepted by two real scheduler DVMs', () async {
+      Future<SchedulerDvm> startDvm(KeyPair key) async {
+        final dvmNdk = Ndk(
+          NdkConfig(
+            eventVerifier: Bip340EventVerifier(useIsolate: false),
+            cache: MemCacheManager(),
+            bootstrapRelays: [relay.url],
+            fetchedRangesEnabled: true,
+            defaultQueryTimeout: const Duration(seconds: 2),
+            defaultBroadcastTimeout: const Duration(seconds: 2),
+          ),
+        );
+        dvmNdk.accounts.loginPrivateKey(
+          pubkey: key.publicKey,
+          privkey: key.privateKey!,
+        );
+
+        final dvmDb = await databaseFactoryMemory.openDatabase(
+          'dvm_redundant_${key.publicKey}_${DateTime.now().microsecondsSinceEpoch}.db',
+        );
+        final dvm = SchedulerDvm(
+          SchedulerDvmConfig(
+            ndk: dvmNdk,
+            database: dvmDb,
+            bootstrapRelays: [relay.url],
+            announceNip89: false,
+          ),
+        );
+
+        addTearDown(() async {
+          await dvm.dispose();
+          await dvmDb.close();
+          await dvmNdk.destroy();
+        });
+
+        await dvm.start();
+        return dvm;
+      }
+
+      final dvmA = await startDvm(dvmKey);
+      await scheduler.startListening();
+
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final signedEvent = await signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'redundant real dvm',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+
+      // The second DVM is offline when the job is scheduled
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey, dvm2Key.publicKey],
+        at: DateTime.now().add(const Duration(minutes: 1)),
+        relays: [relay.url],
+      );
+
+      await _waitFor(() async {
+        final stored = await dvmA.config.store.getJob(job.jobId);
+        return stored?.status == DvmJobStatus.scheduled;
+      });
+
+      // The second DVM comes online and picks the pending request up on
+      // resync, accepting the same job_id independently
+      final dvmB = await startDvm(dvm2Key);
+      await _waitFor(() async {
+        final stored = await dvmB.config.store.getJob(job.jobId);
+        return stored?.status == DvmJobStatus.scheduled;
+      });
+
+      await scheduler.resync();
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs();
+        final synced = jobs.where((j) => j.jobId == job.jobId).firstOrNull;
+        return synced != null &&
+            synced.requests.every(
+              (request) => request.status == JobStatus.scheduled,
+            );
+      });
+
+      final updated = (await scheduler.listJobs()).firstWhere(
+        (j) => j.jobId == job.jobId,
+      );
+      expect(updated.requests, hasLength(2));
+      expect(updated.status, JobStatus.scheduled);
+    });
   });
 
   group('cancel', () {
@@ -394,7 +813,7 @@ void main() {
 
       final job = await scheduler.schedule(
         signedEvent,
-        dvmKey.publicKey,
+        [dvmKey.publicKey],
         relays: [relay.url],
       );
 
@@ -409,7 +828,7 @@ void main() {
       expect(deletions, isNotEmpty);
 
       final deletion = deletions.first;
-      expect(deletion.getTags('e'), contains(job.requestEventId));
+      expect(deletion.getTags('e'), containsAll(job.requestEventIds));
     });
 
     test('cancelPackage deletes linked jobs and manifest', () async {
@@ -434,12 +853,12 @@ void main() {
       final package = await scheduler.schedulePackage([
         SchedulePackageItem(
           event: signedB,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           relays: [relay.url],
         ),
         SchedulePackageItem(
           event: signedC,
-          dvmPubkey: dvmKey.publicKey,
+          dvmPubkeys: [dvmKey.publicKey],
           relays: [relay.url],
         ),
       ], content: 'cancel me');
@@ -486,12 +905,12 @@ void main() {
         final package = await scheduler.schedulePackage([
           SchedulePackageItem(
             event: signedB,
-            dvmPubkey: dvmKey.publicKey,
+            dvmPubkeys: [dvmKey.publicKey],
             relays: [relay.url],
           ),
           SchedulePackageItem(
             event: signedC,
-            dvmPubkey: dvmKey.publicKey,
+            dvmPubkeys: [dvmKey.publicKey],
             relays: [relay.url],
           ),
         ], content: 'cancel even without computed jobs');
@@ -609,7 +1028,7 @@ void main() {
 
       final job = await scheduler.schedule(
         signedEvent,
-        dvmKey.publicKey,
+        [dvmKey.publicKey],
         relays: [relay.url],
       );
 
@@ -618,45 +1037,16 @@ void main() {
       // Wait for feedback subscription to be established
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // Build a feedback kind:7000 from the DVM
-      final ephemeralKey = Bip340.generatePrivateKey();
-      final feedbackPayload = jsonEncode({
-        'status': 'scheduled',
-        'message': 'Job accepted',
-      });
-
-      final encryptedFeedback = await Nip44.encryptMessage(
-        feedbackPayload,
-        ephemeralKey.privateKey!,
-        clientKey.publicKey,
-      );
-
-      final feedbackEvent = Nip01Event(
-        pubKey: dvmKey.publicKey,
-        kind: 7000,
-        tags: [
-          ['r', job.jobId],
-          ['ephemeral-pubkey', ephemeralKey.publicKey],
-        ],
-        content: encryptedFeedback,
-        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      );
-
-      // Sign with DVM key
-      final signedFeedback = Nip01Utils.signWithPrivateKey(
-        event: feedbackEvent,
-        privateKey: dvmKey.privateKey!,
-      );
-
       // Capture status update
       final updates = <StatusUpdate>[];
       final sub = scheduler.statusUpdates.listen(updates.add);
 
-      // Push feedback to the live subscription
-      relay.sendEvent(
-        event: signedFeedback,
-        subId: 'scheduler-feedback',
-        keyPair: dvmKey,
+      // Publish a feedback kind:7000 from the DVM
+      await publishFeedback(
+        dvm: dvmKey,
+        jobId: job.jobId,
+        status: 'scheduled',
+        message: 'Job accepted',
       );
 
       // Wait for processing
@@ -666,6 +1056,7 @@ void main() {
 
       expect(updates, isNotEmpty);
       expect(updates.first.jobId, job.jobId);
+      expect(updates.first.dvmPubkey, dvmKey.publicKey);
       expect(updates.first.status, JobStatus.scheduled);
 
       final jobs = await scheduler.listJobs();
@@ -690,7 +1081,7 @@ void main() {
 
       await scheduler.schedule(
         signedEvent,
-        dvmKey.publicKey,
+        [dvmKey.publicKey],
         relays: [relay.url],
       );
 
@@ -699,6 +1090,32 @@ void main() {
 
       // Nothing should fail
       expect(await scheduler.listJobs(), isNotEmpty);
+    });
+  });
+
+  group('JobStatus.aggregate', () {
+    test('most advanced status wins', () {
+      expect(JobStatus.aggregate([]), isNull);
+      expect(
+        JobStatus.aggregate([JobStatus.pending, JobStatus.failed]),
+        JobStatus.pending,
+      );
+      expect(
+        JobStatus.aggregate([JobStatus.failed, JobStatus.scheduled]),
+        JobStatus.scheduled,
+      );
+      expect(
+        JobStatus.aggregate([JobStatus.scheduled, JobStatus.published]),
+        JobStatus.published,
+      );
+      expect(
+        JobStatus.aggregate([JobStatus.error, JobStatus.failed]),
+        JobStatus.failed,
+      );
+      expect(
+        JobStatus.aggregate([JobStatus.cancelled, JobStatus.error]),
+        JobStatus.error,
+      );
     });
   });
 }
