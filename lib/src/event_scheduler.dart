@@ -246,7 +246,11 @@ class EventScheduler {
 
     await Future.wait([
       for (final request in created.requests)
-        _broadcast.broadcast(request.event, relays: request.broadcastRelays),
+        _broadcast.broadcast(
+          request.event,
+          relays: request.broadcastRelays,
+          pubkey: created.pubkey,
+        ),
     ]);
     _scheduleFeedbackSubscriptionUpdate();
 
@@ -326,8 +330,16 @@ class EventScheduler {
 
     await Future.wait([
       for (final request in requestEvents)
-        _broadcast.broadcast(request.event, relays: request.broadcastRelays),
-      _broadcast.broadcast(signedManifest, relays: userRelays),
+        _broadcast.broadcast(
+          request.event,
+          relays: request.broadcastRelays,
+          pubkey: signer.getPublicKey(),
+        ),
+      _broadcast.broadcast(
+        signedManifest,
+        relays: userRelays,
+        pubkey: signer.getPublicKey(),
+      ),
     ]);
 
     _scheduleFeedbackSubscriptionUpdate();
@@ -362,7 +374,11 @@ class EventScheduler {
     final broadcastRelays = await _deletionRelaysForDvms(job.dvmPubkeys);
 
     // Broadcast via shim
-    await _broadcast.broadcast(signedDeletion, relays: broadcastRelays);
+    await _broadcast.broadcast(
+      signedDeletion,
+      relays: broadcastRelays,
+      pubkey: signer.getPublicKey(),
+    );
 
     // Update local state
     for (final requestEventId in job.requestEventIds) {
@@ -399,6 +415,7 @@ class EventScheduler {
     await _broadcast.broadcast(
       signedDeletion,
       relays: await _packageDeletionBroadcastRelays(package.requestEventIds),
+      pubkey: signer.getPublicKey(),
     );
 
     for (final requestEventId in package.requestEventIds) {
@@ -1062,7 +1079,12 @@ class EventScheduler {
       updatedAt: now,
     );
 
-    return _CreatedJob(job: job, requests: requests, payload: payload);
+    return _CreatedJob(
+      job: job,
+      requests: requests,
+      payload: payload,
+      pubkey: signer.getPublicKey(),
+    );
   }
 
   Future<List<String>> _targetRelays(List<String>? relays) async {
@@ -1184,11 +1206,13 @@ class _CreatedJob {
   final ScheduledJob job;
   final List<_CreatedJobRequest> requests;
   final String payload;
+  final String pubkey;
 
   _CreatedJob({
     required this.job,
     required this.requests,
     required this.payload,
+    required this.pubkey,
   });
 }
 
