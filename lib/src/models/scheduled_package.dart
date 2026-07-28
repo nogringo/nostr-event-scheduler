@@ -2,6 +2,10 @@ import 'scheduled_job.dart';
 
 /// Represents a logical scheduled package backed by one or more DVM jobs.
 class ScheduledPackage {
+  /// Public key of the account that owns this package, i.e. the author of its
+  /// kind:31234 manifest.
+  final String pubkey;
+
   /// 64-char hex identifier from the manifest `d` tag.
   final String packageId;
 
@@ -24,6 +28,7 @@ class ScheduledPackage {
   final int updatedAt;
 
   ScheduledPackage({
+    required this.pubkey,
     required this.packageId,
     required this.manifestEventId,
     required this.content,
@@ -35,6 +40,7 @@ class ScheduledPackage {
 
   Map<String, dynamic> toJson() {
     return {
+      'pubkey': pubkey,
       'packageId': packageId,
       'manifestEventId': manifestEventId,
       'content': content,
@@ -49,6 +55,7 @@ class ScheduledPackage {
     List<ScheduledJob> jobs = const [],
   }) {
     return ScheduledPackage(
+      pubkey: json['pubkey'] as String,
       packageId: json['packageId'] as String,
       manifestEventId: json['manifestEventId'] as String,
       content: json['content'] as String,

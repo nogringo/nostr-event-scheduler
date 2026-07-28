@@ -30,8 +30,33 @@
 - Use direct NDK cache reads for rebuild lookups and feedback reconciliation
   instead of network-capable queries, removing query timeouts from these
   paths.
-- Bump the computed store schema to v3. Existing installs rebuild
-  automatically on the next `startListening()`.
+- Add `clearLocalAccountData({required String pubkey})` and
+  `clearAllLocalData()`, matching the cleanup API of
+  `broadcast_queue_shim_for_ndk`. Local-only and scoped. They also drop the
+  account's scheduler events and matching `fetchedRanges` from the NDK cache,
+  without which the next `resync` would rebuild everything.
+- **Breaking**: the API is multi-account. Every method takes the account it
+  acts for and resolves its signer through `ndk.accounts`; the logged account
+  is never used implicitly. `stopListening()` without a pubkey stops every
+  account, and `jobsStream` and `schedulesStream` become methods.
+- **Breaking**: `ScheduledJob`, `ScheduledPackage`, `StatusUpdate` and
+  `SyncState` carry a required `pubkey`.
+- Split local data in two tiers. Raw holds definitive facts: the signed events
+  in the NDK cache, plus `decrypted_payloads` and `tombstones`, keyed by event
+  id and carrying no account. Computed holds the projections, tagged with their
+  account, and is dropped and recomputed on every schema change, so bumps need
+  no migration script.
+- Recompute projections from raw instead of from `decrypted_payloads`, lazily
+  and per account, so the owner and the DVM pubkey come from the signed event
+  rather than being guessed.
+- Fix raw being incomplete: live subscriptions and the fallback branch of the
+  range-optimised query never wrote to the NDK cache, and locally created
+  events waited on a successful broadcast to reach it.
+- Fix `resync` never reporting `SyncStatus.error`, `startListening` staying
+  half-started after a failed setup, and the schedule streams leaking their
+  store subscriptions.
+- Bump the computed store schema to v4. Existing installs recompute
+  automatically, per account, on first use.
 
 ## 0.2.3
 

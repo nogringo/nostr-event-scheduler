@@ -6,6 +6,8 @@ import 'package:sembast/sembast_io.dart';
 Future<void> main() async {
   final db = await databaseFactoryIo.openDatabase('scheduler.db');
 
+  // The cache must be persistent: it holds the raw events the scheduler
+  // recomputes its projections from.
   final ndk = Ndk(
     NdkConfig(
       eventVerifier: Bip340EventVerifier(),
@@ -19,15 +21,16 @@ Future<void> main() async {
 
   final scheduler = EventScheduler(ndk: ndk, broadcast: broadcast, db: db);
 
-  await scheduler.startListening();
+  final pubkey = ndk.accounts.getPublicKey()!;
+  await scheduler.startListening(pubkey: pubkey);
 
   // Listen to status updates
   scheduler.statusUpdates.listen((update) {
-    print('Job ${update.jobId}: ${update.status}');
+    print('Job ${update.jobId} of ${update.pubkey}: ${update.status}');
   });
 
   // List existing jobs
-  final jobs = await scheduler.listJobs();
+  final jobs = await scheduler.listJobs(pubkey: pubkey);
   print('Existing jobs: ${jobs.length}');
 
   // Dispose when done

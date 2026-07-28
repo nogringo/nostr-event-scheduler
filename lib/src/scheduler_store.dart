@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:sembast/sembast.dart';
 
@@ -12,13 +11,21 @@ import 'models/scheduled_package.dart';
 /// All store names are prefixed with `nostr_event_scheduler/` to avoid
 /// colliding with stores owned by the host app on the shared [Database].
 ///
-/// Manages six stores (prefix omitted below):
-/// - `decrypted_payloads`: eventId -> decrypted JSON payload (cache)
-/// - `pending_decryption`: eventId -> true (queue of events waiting for signer)
+/// Records fall in two tiers (prefix omitted below).
+///
+/// Raw: definitive facts derived from immutable Nostr events. Keyed by event
+/// id, never dropped, never migrated, and carrying no account: attribution to
+/// an account is always read back from the signed events themselves.
+/// - `decrypted_payloads`: eventId -> decrypted payload
 /// - `tombstones`: requestEventId -> deletion metadata
-/// - `jobs`: jobId -> ScheduledJob (computed, droppable)
-/// - `packages`: packageId -> ScheduledPackage metadata (computed, droppable)
-/// - `schema_version`: migration metadata
+///
+/// Computed: projections rebuilt from raw. Dropped and recomputed on every
+/// schema bump, so their shape may change freely.
+/// - `jobs`: jobId -> [ScheduledJob]
+/// - `packages`: packageId -> [ScheduledPackage] metadata
+/// - `pending_decryption`: eventId -> pubkey of the account awaiting a signer
+/// - `schema_version`: shape version of the computed stores, and the version
+///   each account's projections were last built at
 class SchedulerStore {
   final Database _db;
 
@@ -31,10 +38,13 @@ class SchedulerStore {
   static const String _kJobs = '${_kStorePrefix}jobs';
   static const String _kPackages = '${_kStorePrefix}packages';
   static const String _kSchemaVersion = '${_kStorePrefix}schema_version';
-  static const int _currentSchemaVersion = 3;
+
+  static const String _kComputedSchemaKey = 'computed_schema';
+  static const String _kBuiltPrefix = 'built/';
+  static const int _currentSchemaVersion = 4;
 
   final StoreRef<String, String> _decryptedPayloads;
-  final StoreRef<String, bool> _pendingDecryption;
+  final StoreRef<String, String> _pendingDecryption;
   final StoreRef<String, Map<String, dynamic>> _tombstones;
   final StoreRef<String, Map<String, dynamic>> _jobs;
   final StoreRef<String, Map<String, dynamic>> _packages;
@@ -42,33 +52,44 @@ class SchedulerStore {
 
   SchedulerStore(this._db)
     : _decryptedPayloads = StoreRef<String, String>(_kDecryptedPayloads),
-      _pendingDecryption = StoreRef<String, bool>(_kPendingDecryption),
+      _pendingDecryption = StoreRef<String, String>(_kPendingDecryption),
       _tombstones = stringMapStoreFactory.store(_kTombstones),
       _jobs = stringMapStoreFactory.store(_kJobs),
       _packages = stringMapStoreFactory.store(_kPackages),
       _meta = StoreRef<String, int>(_kSchemaVersion);
 
   // --------------------------------------------------------------------------
-  // Schema / Migration
+  // Schema
   // --------------------------------------------------------------------------
 
-  Future<int?> getSchemaVersion() async {
-    final record = _meta.record('version');
-    return record.get(_db);
+  /// Drops every computed store whose shape predates [_currentSchemaVersion].
+  ///
+  /// Uses [SembastStoreRefExtension.drop] rather than a filtered delete so no
+  /// record from an older shape is ever decoded.
+  Future<void> _ensureComputedSchema() async {
+    final version = await _meta.record(_kComputedSchemaKey).get(_db);
+    if (version == _currentSchemaVersion) return;
+
+    await _jobs.drop(_db);
+    await _packages.drop(_db);
+    await _pendingDecryption.drop(_db);
+    await _meta.drop(_db);
+    await _meta.record(_kComputedSchemaKey).put(_db, _currentSchemaVersion);
   }
 
-  Future<void> setSchemaVersion(int version) async {
-    final record = _meta.record('version');
-    await record.put(_db, version);
+  /// Whether [pubkey]'s projections must be rebuilt from raw.
+  Future<bool> needsRebuild(String pubkey) async {
+    await _ensureComputedSchema();
+    final built = await _meta.record('$_kBuiltPrefix$pubkey').get(_db);
+    return built != _currentSchemaVersion;
   }
 
-  Future<bool> needsMigration() async {
-    final version = await getSchemaVersion();
-    return version == null || version < _currentSchemaVersion;
+  Future<void> markBuilt(String pubkey) async {
+    await _meta.record('$_kBuiltPrefix$pubkey').put(_db, _currentSchemaVersion);
   }
 
   // --------------------------------------------------------------------------
-  // Decrypted payloads
+  // Raw - decrypted payloads
   // --------------------------------------------------------------------------
 
   Future<void> putDecryptedPayload(String eventId, String payload) async {
@@ -79,34 +100,12 @@ class SchedulerStore {
     return _decryptedPayloads.record(eventId).get(_db);
   }
 
-  Future<void> removeDecryptedPayload(String eventId) async {
-    await _decryptedPayloads.record(eventId).delete(_db);
+  Future<void> _removeDecryptedPayloads(Iterable<String> eventIds) async {
+    await _decryptedPayloads.records(eventIds.toList()).delete(_db);
   }
 
   // --------------------------------------------------------------------------
-  // Pending decryption
-  // --------------------------------------------------------------------------
-
-  Future<void> addPendingDecryption(String eventId) async {
-    await _pendingDecryption.record(eventId).put(_db, true);
-  }
-
-  Future<void> removePendingDecryption(String eventId) async {
-    await _pendingDecryption.record(eventId).delete(_db);
-  }
-
-  Future<List<String>> listPendingDecryption() async {
-    final records = await _pendingDecryption.find(_db);
-    return records.map((r) => r.key).toList();
-  }
-
-  Future<bool> isPendingDecryption(String eventId) async {
-    final value = await _pendingDecryption.record(eventId).get(_db);
-    return value == true;
-  }
-
-  // --------------------------------------------------------------------------
-  // Tombstones
+  // Raw - tombstones
   // --------------------------------------------------------------------------
 
   Future<void> putTombstone(
@@ -125,17 +124,35 @@ class SchedulerStore {
     return value != null;
   }
 
-  Future<void> removeTombstone(String requestEventId) async {
-    await _tombstones.record(requestEventId).delete(_db);
+  Future<void> _removeTombstones(Iterable<String> requestEventIds) async {
+    await _tombstones.records(requestEventIds.toList()).delete(_db);
   }
 
-  Future<List<String>> listTombstonedRequestEventIds() async {
-    final records = await _tombstones.find(_db);
+  // --------------------------------------------------------------------------
+  // Computed - pending decryption
+  // --------------------------------------------------------------------------
+
+  Future<void> addPendingDecryption(
+    String eventId, {
+    required String pubkey,
+  }) async {
+    await _pendingDecryption.record(eventId).put(_db, pubkey);
+  }
+
+  Future<void> removePendingDecryption(String eventId) async {
+    await _pendingDecryption.record(eventId).delete(_db);
+  }
+
+  Future<List<String>> listPendingDecryption(String pubkey) async {
+    final records = await _pendingDecryption.find(
+      _db,
+      finder: Finder(filter: Filter.equals(Field.value, pubkey)),
+    );
     return records.map((r) => r.key).toList();
   }
 
   // --------------------------------------------------------------------------
-  // Jobs (computed)
+  // Computed - jobs
   // --------------------------------------------------------------------------
 
   Future<void> putJob(ScheduledJob job) async {
@@ -147,14 +164,14 @@ class SchedulerStore {
     return record == null ? null : ScheduledJob.fromJson(record);
   }
 
-  Future<List<ScheduledJob>> listJobs() async {
-    final records = await _jobs.find(_db);
+  Future<List<ScheduledJob>> listJobs(String pubkey) async {
+    final records = await _jobs.find(_db, finder: _byPubkey(pubkey));
     return records.map((r) => ScheduledJob.fromJson(r.value)).toList();
   }
 
-  Stream<List<ScheduledJob>> watchJobs() {
+  Stream<List<ScheduledJob>> watchJobs(String pubkey) {
     return _jobs
-        .query()
+        .query(finder: _byPubkey(pubkey))
         .onSnapshots(_db)
         .map(
           (snapshots) =>
@@ -166,12 +183,8 @@ class SchedulerStore {
     await _jobs.record(jobId).delete(_db);
   }
 
-  Future<void> clearJobs() async {
-    await _jobs.delete(_db);
-  }
-
   // --------------------------------------------------------------------------
-  // Packages (computed)
+  // Computed - packages
   // --------------------------------------------------------------------------
 
   Future<void> putPackage(ScheduledPackage package) async {
@@ -181,34 +194,23 @@ class SchedulerStore {
   Future<ScheduledPackage?> getPackage(String packageId) async {
     final record = await _packages.record(packageId).get(_db);
     if (record == null) return null;
-    return ScheduledPackage.fromJson(
-      record,
-      jobs: await _jobsForRequestEventIds(
-        (record['requestEventIds'] as List<dynamic>).map((e) => e as String),
-      ),
-    );
+    return _hydratePackage(record);
   }
 
-  Future<List<ScheduledPackage>> listPackages() async {
-    final records = await _packages.find(_db);
+  Future<List<ScheduledPackage>> listPackages(String pubkey) async {
+    final records = await _packages.find(_db, finder: _byPubkey(pubkey));
     final packages = <ScheduledPackage>[];
     for (final record in records) {
-      packages.add(
-        ScheduledPackage.fromJson(
-          record.value,
-          jobs: await _jobsForRequestEventIds(
-            (record.value['requestEventIds'] as List<dynamic>).map(
-              (e) => e as String,
-            ),
-          ),
-        ),
-      );
+      packages.add(await _hydratePackage(record.value));
     }
     return packages;
   }
 
-  Stream<List<ScheduledPackage>> watchPackages() {
-    return _packages.query().onSnapshots(_db).asyncMap((_) => listPackages());
+  Stream<List<ScheduledPackage>> watchPackages(String pubkey) {
+    return _packages
+        .query(finder: _byPubkey(pubkey))
+        .onSnapshots(_db)
+        .asyncMap((_) => listPackages(pubkey));
   }
 
   Future<void> removePackage(String packageId) async {
@@ -216,24 +218,19 @@ class SchedulerStore {
   }
 
   Future<void> removePackageByManifestEventId(String manifestEventId) async {
-    final records = await _packages.find(_db);
-    for (final record in records) {
-      if (record.value['manifestEventId'] == manifestEventId) {
-        await _packages.record(record.key).delete(_db);
-      }
-    }
+    final records = await _packages.find(
+      _db,
+      finder: Finder(filter: Filter.equals('manifestEventId', manifestEventId)),
+    );
+    await _packages.records(records.map((r) => r.key).toList()).delete(_db);
   }
 
-  Future<void> clearPackages() async {
-    await _packages.delete(_db);
-  }
-
-  Future<List<ScheduledItem>> listSchedules() async {
-    final packages = await listPackages();
+  Future<List<ScheduledItem>> listSchedules(String pubkey) async {
+    final packages = await listPackages(pubkey);
     final packagedRequestIds = packages
         .expand((p) => p.requestEventIds)
         .toSet();
-    final standaloneJobs = (await listJobs())
+    final standaloneJobs = (await listJobs(pubkey))
         .where((job) => !job.requestEventIds.any(packagedRequestIds.contains))
         .map(ScheduledItem.job);
     final items = <ScheduledItem>[
@@ -245,63 +242,63 @@ class SchedulerStore {
   }
 
   // --------------------------------------------------------------------------
-  // Rebuild computed
+  // Clearing
   // --------------------------------------------------------------------------
 
-  /// Drops and rebuilds computed stores from decrypted payloads and tombstones.
-  ///
-  /// [buildJob] is a callback that receives (eventId, decryptedPayload)
-  /// and returns a single-request [ScheduledJob] or null if the payload is
-  /// invalid. Fragments sharing a job_id are merged into one job, one
-  /// request per kind:5905 event.
-  Future<void> rebuildComputed(
-    Future<ScheduledJob?> Function(String eventId, String payload) buildJob, {
-    Future<ScheduledPackage?> Function(String eventId, String payload)?
-    buildPackage,
-  }) async {
-    await clearJobs();
-    await clearPackages();
-
-    final payloads = await _decryptedPayloads.find(_db);
-    for (final record in payloads) {
-      final eventId = record.key;
-      final payload = record.value;
-      final job = await buildJob(eventId, payload);
-      if (job == null) continue;
-
-      final existing = await getJob(job.jobId);
-      if (existing == null) {
-        await putJob(job);
-        continue;
-      }
-      for (final request in job.requests) {
-        if (existing.requestForEventId(request.requestEventId) == null) {
-          existing.requests.add(request);
-        }
-      }
-      existing.updatedAt = max(existing.updatedAt, job.updatedAt);
-      await putJob(existing);
-    }
-
-    if (buildPackage != null) {
-      for (final record in payloads) {
-        final eventId = record.key;
-        final payload = record.value;
-        final package = await buildPackage(eventId, payload);
-        if (package != null) {
-          await putPackage(package);
-        }
-      }
-    }
-
-    await setSchemaVersion(_currentSchemaVersion);
+  /// Drops [pubkey]'s projections, forcing a rebuild from raw on next use.
+  Future<void> clearComputed(String pubkey) async {
+    await _ensureComputedSchema();
+    await _jobs.delete(_db, finder: _byPubkey(pubkey));
+    await _packages.delete(_db, finder: _byPubkey(pubkey));
+    await _pendingDecryption.delete(
+      _db,
+      finder: Finder(filter: Filter.equals(Field.value, pubkey)),
+    );
+    await _meta.record('$_kBuiltPrefix$pubkey').delete(_db);
   }
 
-  Future<List<ScheduledJob>> _jobsForRequestEventIds(
-    Iterable<String> requestEventIds,
-  ) async {
-    final ids = requestEventIds.toSet();
-    final jobs = await listJobs();
-    return jobs.where((job) => job.requestEventIds.any(ids.contains)).toList();
+  /// Removes the raw records derived from [eventIds].
+  Future<void> clearRaw(Iterable<String> eventIds) async {
+    final ids = eventIds.toList();
+    await _removeDecryptedPayloads(ids);
+    await _removeTombstones(ids);
+  }
+
+  /// Drops every store owned by the package, all accounts included.
+  Future<void> clearAll() async {
+    await _decryptedPayloads.drop(_db);
+    await _tombstones.drop(_db);
+    await _jobs.drop(_db);
+    await _packages.drop(_db);
+    await _pendingDecryption.drop(_db);
+    await _meta.drop(_db);
+  }
+
+  /// Public keys owning at least one projection.
+  Future<Set<String>> listKnownPubkeys() async {
+    await _ensureComputedSchema();
+    final jobs = await _jobs.find(_db);
+    final packages = await _packages.find(_db);
+    return {
+      ...jobs.map((r) => r.value['pubkey'] as String),
+      ...packages.map((r) => r.value['pubkey'] as String),
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Helpers
+  // --------------------------------------------------------------------------
+
+  Finder _byPubkey(String pubkey) =>
+      Finder(filter: Filter.equals('pubkey', pubkey));
+
+  Future<ScheduledPackage> _hydratePackage(Map<String, dynamic> record) async {
+    final requestEventIds = (record['requestEventIds'] as List<dynamic>)
+        .map((e) => e as String)
+        .toSet();
+    final jobs = (await listJobs(record['pubkey'] as String))
+        .where((job) => job.requestEventIds.any(requestEventIds.contains))
+        .toList();
+    return ScheduledPackage.fromJson(record, jobs: jobs);
   }
 }

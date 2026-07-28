@@ -48,6 +48,7 @@ Future<void> _waitFor(
 void main() {
   late MockRelay relay;
   late KeyPair clientKey;
+  late KeyPair client2Key;
   late KeyPair dvmKey;
   late KeyPair dvm2Key;
   late Ndk ndk;
@@ -102,12 +103,18 @@ void main() {
     relay = MockRelay(name: 'test relay', explicitPort: 9090);
 
     clientKey = Bip340.generatePrivateKey();
+    client2Key = Bip340.generatePrivateKey();
     dvmKey = Bip340.generatePrivateKey();
     dvm2Key = Bip340.generatePrivateKey();
 
     // Serve NIP-65s so the scheduler can find relays for broadcast
     final nip65 = Nip65(
       pubKey: clientKey.publicKey,
+      relays: {relay.url: ReadWriteMarker.readWrite},
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final client2Nip65 = Nip65(
+      pubKey: client2Key.publicKey,
       relays: {relay.url: ReadWriteMarker.readWrite},
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
@@ -122,7 +129,12 @@ void main() {
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
     await relay.startServer(
-      nip65s: {clientKey: nip65, dvmKey: dvmNip65, dvm2Key: dvm2Nip65},
+      nip65s: {
+        clientKey: nip65,
+        client2Key: client2Nip65,
+        dvmKey: dvmNip65,
+        dvm2Key: dvm2Nip65,
+      },
     );
 
     ndk = Ndk(
@@ -178,6 +190,7 @@ void main() {
         signedEvent,
         [dvmKey.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
       expect(job.jobId, isNotEmpty);
@@ -215,6 +228,7 @@ void main() {
         signedEvent,
         [dvmKey.publicKey, dvm2Key.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
       expect(job.requests, hasLength(2));
@@ -223,8 +237,14 @@ void main() {
         containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
       );
       expect(job.status, JobStatus.pending);
-      expect(await scheduler.listJobs(), hasLength(1));
-      expect(await scheduler.listSchedules(), hasLength(1));
+      expect(
+        await scheduler.listJobs(pubkey: clientKey.publicKey),
+        hasLength(1),
+      );
+      expect(
+        await scheduler.listSchedules(pubkey: clientKey.publicKey),
+        hasLength(1),
+      );
 
       // Give the shim time to broadcast
       await Future.delayed(const Duration(milliseconds: 500));
@@ -272,9 +292,10 @@ void main() {
         signedEvent,
         [dvmKey.publicKey, dvm2Key.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
-      await scheduler.startListening();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
       await Future.delayed(const Duration(milliseconds: 500));
 
       final updates = <StatusUpdate>[];
@@ -283,11 +304,13 @@ void main() {
       // First DVM fails: the other one is still pending, so the job is too
       await publishFeedback(dvm: dvmKey, jobId: job.jobId, status: 'failed');
       await _waitFor(() async {
-        final jobs = await scheduler.listJobs();
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
         return jobs.single.requestForDvm(dvmKey.publicKey)!.status ==
             JobStatus.failed;
       });
-      var current = (await scheduler.listJobs()).single;
+      var current = (await scheduler.listJobs(
+        pubkey: clientKey.publicKey,
+      )).single;
       expect(current.status, JobStatus.pending);
 
       // Second DVM accepts: one acceptance is enough
@@ -297,11 +320,11 @@ void main() {
         status: 'scheduled',
       );
       await _waitFor(() async {
-        final jobs = await scheduler.listJobs();
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
         return jobs.single.requestForDvm(dvm2Key.publicKey)!.status ==
             JobStatus.scheduled;
       });
-      current = (await scheduler.listJobs()).single;
+      current = (await scheduler.listJobs(pubkey: clientKey.publicKey)).single;
       expect(current.status, JobStatus.scheduled);
 
       await sub.cancel();
@@ -328,10 +351,11 @@ void main() {
         signedEvent,
         [dvmKey.publicKey, dvm2Key.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
       expect(job.requestEventIds, hasLength(2));
 
-      await scheduler.cancel(job.jobId);
+      await scheduler.cancel(job.jobId, pubkey: clientKey.publicKey);
 
       await Future.delayed(const Duration(milliseconds: 500));
 
@@ -340,7 +364,7 @@ void main() {
       );
       expect(deletions, hasLength(1));
       expect(deletions.single.getTags('e'), containsAll(job.requestEventIds));
-      expect(await scheduler.listJobs(), isEmpty);
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
     });
 
     test('merges kind:5905 requests sharing a job_id from the relay', () async {
@@ -400,21 +424,26 @@ void main() {
             .broadcastDoneFuture;
       }
 
-      await scheduler.startListening();
-      await scheduler.resync();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await scheduler.resync(pubkey: clientKey.publicKey);
 
       await _waitFor(() async {
-        final jobs = await scheduler.listJobs();
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
         return jobs.length == 1 && jobs.single.requests.length == 2;
       });
 
-      final job = (await scheduler.listJobs()).single;
+      final job = (await scheduler.listJobs(
+        pubkey: clientKey.publicKey,
+      )).single;
       expect(job.jobId, jobId);
       expect(
         job.dvmPubkeys,
         containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
       );
-      expect(await scheduler.listSchedules(), hasLength(1));
+      expect(
+        await scheduler.listSchedules(pubkey: clientKey.publicKey),
+        hasLength(1),
+      );
     });
   });
 
@@ -450,19 +479,24 @@ void main() {
         signedA,
         [dvmKey.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
-      final package = await scheduler.schedulePackage([
-        SchedulePackageItem(
-          event: signedB,
-          dvmPubkeys: [dvmKey.publicKey],
-          relays: [relay.url],
-        ),
-        SchedulePackageItem(
-          event: signedC,
-          dvmPubkeys: [dvmKey.publicKey],
-          relays: [relay.url],
-        ),
-      ], content: 'opaque display context');
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: signedB,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: signedC,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'opaque display context',
+        pubkey: clientKey.publicKey,
+      );
 
       expect(package.jobs, hasLength(2));
       expect(package.content, 'opaque display context');
@@ -490,10 +524,12 @@ void main() {
       );
       expect(decrypted, 'opaque display context');
 
-      final jobs = await scheduler.listJobs();
+      final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
       expect(jobs, hasLength(3));
 
-      final schedules = await scheduler.listSchedules();
+      final schedules = await scheduler.listSchedules(
+        pubkey: clientKey.publicKey,
+      );
       expect(schedules, hasLength(2));
       expect(
         schedules.where((item) => item.type == ScheduledItemType.package),
@@ -519,14 +555,18 @@ void main() {
         event,
       );
 
-      final package = await scheduler.schedulePackage([
-        SchedulePackageItem(
-          event: signedEvent,
-          dvmPubkeys: [fallbackDvmKey.publicKey],
-          relays: [relay.url],
-          dvmReadRelays: [relay.url],
-        ),
-      ], content: 'fallback context');
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: signedEvent,
+            dvmPubkeys: [fallbackDvmKey.publicKey],
+            relays: [relay.url],
+            dvmReadRelays: [relay.url],
+          ),
+        ],
+        content: 'fallback context',
+        pubkey: clientKey.publicKey,
+      );
 
       expect(package.jobs.single.dvmPubkeys, [fallbackDvmKey.publicKey]);
 
@@ -562,18 +602,22 @@ void main() {
         ),
       );
 
-      final package = await scheduler.schedulePackage([
-        SchedulePackageItem(
-          event: signedB,
-          dvmPubkeys: [dvmKey.publicKey, dvm2Key.publicKey],
-          relays: [relay.url],
-        ),
-        SchedulePackageItem(
-          event: signedC,
-          dvmPubkeys: [dvmKey.publicKey],
-          relays: [relay.url],
-        ),
-      ], content: 'redundant package context');
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: signedB,
+            dvmPubkeys: [dvmKey.publicKey, dvm2Key.publicKey],
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: signedC,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'redundant package context',
+        pubkey: clientKey.publicKey,
+      );
 
       expect(package.jobs, hasLength(2));
       expect(package.requestEventIds, hasLength(3));
@@ -601,7 +645,9 @@ void main() {
       expect(requests, hasLength(3));
 
       // The package stays one logical schedule
-      final schedules = await scheduler.listSchedules();
+      final schedules = await scheduler.listSchedules(
+        pubkey: clientKey.publicKey,
+      );
       expect(schedules, hasLength(1));
       expect(schedules.single.type, ScheduledItemType.package);
     });
@@ -641,7 +687,7 @@ void main() {
       });
 
       await dvm.start();
-      await scheduler.startListening();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
 
       final signer = ndk.accounts.getLoggedAccount()!.signer;
       final eventB = await signer.sign(
@@ -663,20 +709,24 @@ void main() {
         ),
       );
 
-      final package = await scheduler.schedulePackage([
-        SchedulePackageItem(
-          event: eventB,
-          dvmPubkeys: [dvmKey.publicKey],
-          at: DateTime.now().add(const Duration(minutes: 1)),
-          relays: [relay.url],
-        ),
-        SchedulePackageItem(
-          event: eventC,
-          dvmPubkeys: [dvmKey.publicKey],
-          at: DateTime.now().add(const Duration(minutes: 1)),
-          relays: [relay.url],
-        ),
-      ], content: 'real dvm package context');
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: eventB,
+            dvmPubkeys: [dvmKey.publicKey],
+            at: DateTime.now().add(const Duration(minutes: 1)),
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: eventC,
+            dvmPubkeys: [dvmKey.publicKey],
+            at: DateTime.now().add(const Duration(minutes: 1)),
+            relays: [relay.url],
+          ),
+        ],
+        content: 'real dvm package context',
+        pubkey: clientKey.publicKey,
+      );
 
       await _waitFor(() async {
         for (final job in package.jobs) {
@@ -686,16 +736,18 @@ void main() {
         return true;
       });
 
-      await scheduler.resync();
+      await scheduler.resync(pubkey: clientKey.publicKey);
       await _waitFor(() async {
-        final jobs = await scheduler.listJobs();
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
         final packageJobIds = package.jobs.map((job) => job.jobId).toSet();
         return jobs
             .where((job) => packageJobIds.contains(job.jobId))
             .every((job) => job.status == JobStatus.scheduled);
       });
 
-      final schedules = await scheduler.listSchedules();
+      final schedules = await scheduler.listSchedules(
+        pubkey: clientKey.publicKey,
+      );
       final packageItem = schedules.firstWhere(
         (item) => item.type == ScheduledItemType.package,
       );
@@ -746,7 +798,7 @@ void main() {
       }
 
       final dvmA = await startDvm(dvmKey);
-      await scheduler.startListening();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
 
       final signer = ndk.accounts.getLoggedAccount()!.signer;
       final signedEvent = await signer.sign(
@@ -765,6 +817,7 @@ void main() {
         [dvmKey.publicKey, dvm2Key.publicKey],
         at: DateTime.now().add(const Duration(minutes: 1)),
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
       await _waitFor(() async {
@@ -780,9 +833,9 @@ void main() {
         return stored?.status == DvmJobStatus.scheduled;
       });
 
-      await scheduler.resync();
+      await scheduler.resync(pubkey: clientKey.publicKey);
       await _waitFor(() async {
-        final jobs = await scheduler.listJobs();
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
         final synced = jobs.where((j) => j.jobId == job.jobId).firstOrNull;
         return synced != null &&
             synced.requests.every(
@@ -790,9 +843,9 @@ void main() {
             );
       });
 
-      final updated = (await scheduler.listJobs()).firstWhere(
-        (j) => j.jobId == job.jobId,
-      );
+      final updated = (await scheduler.listJobs(
+        pubkey: clientKey.publicKey,
+      )).firstWhere((j) => j.jobId == job.jobId);
       expect(updated.requests, hasLength(2));
       expect(updated.status, JobStatus.scheduled);
     });
@@ -815,9 +868,10 @@ void main() {
         signedEvent,
         [dvmKey.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
-      await scheduler.cancel(job.jobId);
+      await scheduler.cancel(job.jobId, pubkey: clientKey.publicKey);
 
       // Give the shim time to broadcast
       await Future.delayed(const Duration(milliseconds: 500));
@@ -850,20 +904,27 @@ void main() {
       final signedB = await signer.sign(eventB);
       final signedC = await signer.sign(eventC);
 
-      final package = await scheduler.schedulePackage([
-        SchedulePackageItem(
-          event: signedB,
-          dvmPubkeys: [dvmKey.publicKey],
-          relays: [relay.url],
-        ),
-        SchedulePackageItem(
-          event: signedC,
-          dvmPubkeys: [dvmKey.publicKey],
-          relays: [relay.url],
-        ),
-      ], content: 'cancel me');
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: signedB,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: signedC,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'cancel me',
+        pubkey: clientKey.publicKey,
+      );
 
-      await scheduler.cancelPackage(package.packageId);
+      await scheduler.cancelPackage(
+        package.packageId,
+        pubkey: clientKey.publicKey,
+      );
 
       await Future.delayed(const Duration(milliseconds: 500));
 
@@ -876,9 +937,15 @@ void main() {
       expect(deletion.getTags('e'), containsAll(package.requestEventIds));
       expect(deletion.getTags('e'), contains(package.manifestEventId));
       expect(deletion.getTags('k'), containsAll(['5905', '31234']));
-      expect(await scheduler.listJobs(), isEmpty);
-      expect(await scheduler.listPackages(), isEmpty);
-      expect(await scheduler.listSchedules(), isEmpty);
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+      expect(
+        await scheduler.listPackages(pubkey: clientKey.publicKey),
+        isEmpty,
+      );
+      expect(
+        await scheduler.listSchedules(pubkey: clientKey.publicKey),
+        isEmpty,
+      );
     });
 
     test(
@@ -902,29 +969,38 @@ void main() {
         final signedB = await signer.sign(eventB);
         final signedC = await signer.sign(eventC);
 
-        final package = await scheduler.schedulePackage([
-          SchedulePackageItem(
-            event: signedB,
-            dvmPubkeys: [dvmKey.publicKey],
-            relays: [relay.url],
-          ),
-          SchedulePackageItem(
-            event: signedC,
-            dvmPubkeys: [dvmKey.publicKey],
-            relays: [relay.url],
-          ),
-        ], content: 'cancel even without computed jobs');
+        final package = await scheduler.schedulePackage(
+          [
+            SchedulePackageItem(
+              event: signedB,
+              dvmPubkeys: [dvmKey.publicKey],
+              relays: [relay.url],
+            ),
+            SchedulePackageItem(
+              event: signedC,
+              dvmPubkeys: [dvmKey.publicKey],
+              relays: [relay.url],
+            ),
+          ],
+          content: 'cancel even without computed jobs',
+          pubkey: clientKey.publicKey,
+        );
 
         await sembast.stringMapStoreFactory
             .store('nostr_event_scheduler/jobs')
             .delete(schedulerDb);
 
-        expect(await scheduler.listJobs(), isEmpty);
-        final packages = await scheduler.listPackages();
+        expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+        final packages = await scheduler.listPackages(
+          pubkey: clientKey.publicKey,
+        );
         expect(packages.single.requestEventIds, package.requestEventIds);
         expect(packages.single.jobs, isEmpty);
 
-        await scheduler.cancelPackage(package.packageId);
+        await scheduler.cancelPackage(
+          package.packageId,
+          pubkey: clientKey.publicKey,
+        );
 
         await Future.delayed(const Duration(milliseconds: 500));
 
@@ -937,8 +1013,14 @@ void main() {
         expect(deletion.getTags('e'), containsAll(package.requestEventIds));
         expect(deletion.getTags('e'), contains(package.manifestEventId));
         expect(deletion.getTags('k'), containsAll(['5905', '31234']));
-        expect(await scheduler.listPackages(), isEmpty);
-        expect(await scheduler.listSchedules(), isEmpty);
+        expect(
+          await scheduler.listPackages(pubkey: clientKey.publicKey),
+          isEmpty,
+        );
+        expect(
+          await scheduler.listSchedules(pubkey: clientKey.publicKey),
+          isEmpty,
+        );
       },
     );
   });
@@ -1002,13 +1084,13 @@ void main() {
           .broadcastDoneFuture;
 
       // Start listening and resync
-      await scheduler.startListening();
-      await scheduler.resync();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await scheduler.resync(pubkey: clientKey.publicKey);
 
       // Wait for processing
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final jobs = await scheduler.listJobs();
+      final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
       expect(jobs.any((j) => j.jobId == jobId), isTrue);
     });
   });
@@ -1030,9 +1112,10 @@ void main() {
         signedEvent,
         [dvmKey.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
-      await scheduler.startListening();
+      await scheduler.startListening(pubkey: clientKey.publicKey);
 
       // Wait for feedback subscription to be established
       await Future.delayed(const Duration(milliseconds: 500));
@@ -1059,7 +1142,7 @@ void main() {
       expect(updates.first.dvmPubkey, dvmKey.publicKey);
       expect(updates.first.status, JobStatus.scheduled);
 
-      final jobs = await scheduler.listJobs();
+      final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
       final updatedJob = jobs.firstWhere((j) => j.jobId == job.jobId);
       expect(updatedJob.status, JobStatus.scheduled);
     });
@@ -1083,13 +1166,169 @@ void main() {
         signedEvent,
         [dvmKey.publicKey],
         relays: [relay.url],
+        pubkey: clientKey.publicKey,
       );
 
       // decryptPending should be a no-op since signer is already available
-      await scheduler.decryptPending();
+      await scheduler.decryptPending(pubkey: clientKey.publicKey);
 
       // Nothing should fail
-      expect(await scheduler.listJobs(), isNotEmpty);
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isNotEmpty);
+    });
+  });
+
+  Future<ScheduledJob> scheduleFor(KeyPair key, String content) async {
+    final signer = ndk.accounts.accounts[key.publicKey]!.signer;
+    final signed = await signer.sign(
+      Nip01Event(
+        pubKey: key.publicKey,
+        kind: 1,
+        tags: [],
+        content: content,
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      ),
+    );
+    return scheduler.schedule(
+      signed,
+      [dvmKey.publicKey],
+      relays: [relay.url],
+      pubkey: key.publicKey,
+    );
+  }
+
+  group('multi-account', () {
+    setUp(() {
+      ndk.accounts.loginPrivateKey(
+        pubkey: client2Key.publicKey,
+        privkey: client2Key.privateKey!,
+      );
+    });
+
+    test('keeps the schedules of two accounts apart', () async {
+      final first = await scheduleFor(clientKey, 'account one');
+      final second = await scheduleFor(client2Key, 'account two');
+
+      final firstJobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
+      final secondJobs = await scheduler.listJobs(pubkey: client2Key.publicKey);
+
+      expect(firstJobs.single.jobId, first.jobId);
+      expect(firstJobs.single.pubkey, clientKey.publicKey);
+      expect(secondJobs.single.jobId, second.jobId);
+      expect(secondJobs.single.pubkey, client2Key.publicKey);
+
+      expect(
+        (await scheduler.listSchedules(pubkey: clientKey.publicKey)).single.id,
+        first.jobId,
+      );
+    });
+
+    test('refuses to cancel a job owned by another account', () async {
+      final job = await scheduleFor(clientKey, 'not yours');
+
+      expect(
+        () => scheduler.cancel(job.jobId, pubkey: client2Key.publicKey),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('clearLocalAccountData', () {
+    setUp(() {
+      ndk.accounts.loginPrivateKey(
+        pubkey: client2Key.publicKey,
+        privkey: client2Key.privateKey!,
+      );
+    });
+
+    test('drops one account and leaves the other untouched', () async {
+      await scheduleFor(clientKey, 'to be cleared');
+      final kept = await scheduleFor(client2Key, 'to be kept');
+
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+      expect(
+        (await scheduler.listJobs(pubkey: client2Key.publicKey)).single.jobId,
+        kept.jobId,
+      );
+    });
+
+    test('is idempotent', () async {
+      await scheduleFor(clientKey, 'cleared twice');
+      final kept = await scheduleFor(client2Key, 'kept');
+
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+      expect(
+        (await scheduler.listJobs(pubkey: client2Key.publicKey)).single.jobId,
+        kept.jobId,
+      );
+    });
+
+    test('purges raw so the account is not rebuilt from cache', () async {
+      await scheduleFor(clientKey, 'no resurrection');
+
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+
+      expect(
+        await ndk.config.cache.loadEvents(
+          pubKeys: [clientKey.publicKey],
+          kinds: [5905],
+        ),
+        isEmpty,
+      );
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+    });
+  });
+
+  group('clearAllLocalData', () {
+    test('empties every account', () async {
+      ndk.accounts.loginPrivateKey(
+        pubkey: client2Key.publicKey,
+        privkey: client2Key.privateKey!,
+      );
+      await scheduleFor(clientKey, 'first');
+      await scheduleFor(client2Key, 'second');
+
+      await scheduler.clearAllLocalData();
+      await scheduler.clearAllLocalData();
+
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+      expect(await scheduler.listJobs(pubkey: client2Key.publicKey), isEmpty);
+    });
+  });
+
+  group('computed projections', () {
+    test('are rebuilt from raw once dropped', () async {
+      final job = await scheduleFor(clientKey, 'rebuild me');
+
+      // Drop the computed tier the way a schema bump does.
+      await sembast.StoreRef<String, Map<String, dynamic>>(
+        'nostr_event_scheduler/jobs',
+      ).drop(schedulerDb);
+      await sembast.StoreRef<String, int>(
+        'nostr_event_scheduler/schema_version',
+      ).record('built/${clientKey.publicKey}').delete(schedulerDb);
+
+      final rebuilt = await scheduler.listJobs(pubkey: clientKey.publicKey);
+
+      expect(rebuilt.single.jobId, job.jobId);
+      expect(rebuilt.single.pubkey, clientKey.publicKey);
+      expect(rebuilt.single.requests.single.dvmPubkey, dvmKey.publicKey);
+      expect(rebuilt.single.targetEvent.content, 'rebuild me');
+    });
+
+    test('keep a cancelled job cancelled across a rebuild', () async {
+      final job = await scheduleFor(clientKey, 'cancelled');
+      await scheduler.cancel(job.jobId, pubkey: clientKey.publicKey);
+
+      await sembast.StoreRef<String, int>(
+        'nostr_event_scheduler/schema_version',
+      ).record('built/${clientKey.publicKey}').delete(schedulerDb);
+
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
     });
   });
 
