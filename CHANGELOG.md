@@ -1,3 +1,10 @@
+## 0.4.0
+
+- **Breaking**: require `ndk: ^0.9.0` and `broadcast_queue_shim_for_ndk: ^0.5.0`.
+  `ndk` 0.9.0 is a breaking release, so host apps have to move with it. No
+  source change was needed on this side.
+- Update dev dependencies (`nostr_scheduler_dvm: ^0.2.0`, `test: ^1.31.2`).
+
 ## 0.3.0
 
 - Support redundant scheduling across multiple Scheduler DVMs (#1).
