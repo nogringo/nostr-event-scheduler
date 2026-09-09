@@ -1,3 +1,9 @@
+## 0.4.1
+
+- Widen the `ndk` constraint to `>=0.9.0 <0.11.0` so the 0.10.x line resolves.
+- Require `broadcast_queue_shim_for_ndk: ^0.5.1` and, for tests,
+  `nostr_scheduler_dvm: ^0.2.2`, the versions that allow `ndk` 0.10.x too.
+
 ## 0.4.0
 
 - **Breaking**: require `ndk: ^0.9.0` and `broadcast_queue_shim_for_ndk: ^0.5.0`.
