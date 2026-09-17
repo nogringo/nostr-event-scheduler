@@ -20,8 +20,13 @@ Future<EventScheduler> createScheduler({
   required Ndk ndk,
   required Database broadcastDb,
   required Database schedulerDb,
+  required List<String> relayListDiscoveryRelays,
 }) async {
-  final broadcast = OfflineBroadcast.withNdk(ndk, db: broadcastDb);
+  final broadcast = OfflineBroadcast.withNdk(
+    ndk,
+    db: broadcastDb,
+    relayListDiscoveryRelays: relayListDiscoveryRelays,
+  );
   broadcast.start();
 
   final scheduler = EventScheduler(
@@ -162,6 +167,7 @@ void main() {
       ndk: ndk,
       broadcastDb: broadcastDb,
       schedulerDb: schedulerDb,
+      relayListDiscoveryRelays: [relay.url],
     );
   });
 
@@ -1196,6 +1202,12 @@ void main() {
     );
   }
 
+  // The shim resolves relay sets in the background, so a clear racing the
+  // first attempt would see the request written back to the NDK cache.
+  Future<void> waitForRequestsOnRelay(int count) => _waitFor(
+    () async => (await relayQuery(Filter(kinds: [5905]))).length >= count,
+  );
+
   group('multi-account', () {
     setUp(() {
       ndk.accounts.loginPrivateKey(
@@ -1243,6 +1255,7 @@ void main() {
     test('drops one account and leaves the other untouched', () async {
       await scheduleFor(clientKey, 'to be cleared');
       final kept = await scheduleFor(client2Key, 'to be kept');
+      await waitForRequestsOnRelay(2);
 
       await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
 
@@ -1256,6 +1269,7 @@ void main() {
     test('is idempotent', () async {
       await scheduleFor(clientKey, 'cleared twice');
       final kept = await scheduleFor(client2Key, 'kept');
+      await waitForRequestsOnRelay(2);
 
       await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
       await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
@@ -1269,6 +1283,7 @@ void main() {
 
     test('purges raw so the account is not rebuilt from cache', () async {
       await scheduleFor(clientKey, 'no resurrection');
+      await waitForRequestsOnRelay(1);
 
       await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
 
@@ -1291,6 +1306,7 @@ void main() {
       );
       await scheduleFor(clientKey, 'first');
       await scheduleFor(client2Key, 'second');
+      await waitForRequestsOnRelay(2);
 
       await scheduler.clearAllLocalData();
       await scheduler.clearAllLocalData();

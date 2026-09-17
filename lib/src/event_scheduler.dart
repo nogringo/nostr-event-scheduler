@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/ndk.dart';
+import 'package:ndk/ndk.dart' hide RelaySet;
 import 'package:sembast/sembast.dart' as sembast;
 
 import 'kinds.dart';
@@ -42,7 +42,10 @@ class EventScheduler {
 
   /// Creates a new [EventScheduler].
   ///
-  /// The caller must provide a started [OfflineBroadcast] instance.
+  /// The caller must provide a started [OfflineBroadcast] instance. It must be
+  /// able to resolve relay lists, so build it with [OfflineBroadcast.withNdk]
+  /// or pass a `relayListFn`: the scheduler targets NIP-65 relay lists rather
+  /// than fixed URLs.
   EventScheduler({
     required this._ndk,
     required this._broadcast,
@@ -286,7 +289,10 @@ class EventScheduler {
   ///
   /// The kind:5905 requests are broadcast via the [OfflineBroadcast] shim to
   /// all the account's NIP-65 relays (read + write) plus each DVM's read
-  /// relays.
+  /// relays. Both are described as a [RelaySet] and resolved by the shim's
+  /// worker, so a DVM whose relay list cannot be read right now delays
+  /// delivery instead of failing the call. [dvmReadRelays] is used only for a
+  /// DVM whose NIP-65 resolves to no read relay.
   Future<ScheduledJob> schedule(
     Nip01Event event,
     List<String> dvmPubkeys, {
@@ -315,7 +321,7 @@ class EventScheduler {
       for (final request in created.requests)
         _broadcast.broadcast(
           request.event,
-          relays: request.broadcastRelays,
+          relaySet: request.relaySet,
           pubkey: pubkey,
         ),
     ]);
@@ -373,7 +379,6 @@ class EventScheduler {
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
     final signedManifest = await signer.sign(manifest);
-    final userRelays = await _userBroadcastRelays(pubkey);
 
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final package = ScheduledPackage(
@@ -402,10 +407,14 @@ class EventScheduler {
       for (final request in requestEvents)
         _broadcast.broadcast(
           request.event,
-          relays: request.broadcastRelays,
+          relaySet: request.relaySet,
           pubkey: pubkey,
         ),
-      _broadcast.broadcast(signedManifest, relays: userRelays, pubkey: pubkey),
+      _broadcast.broadcast(
+        signedManifest,
+        relaySet: RelaySet.nip65(pubkey),
+        pubkey: pubkey,
+      ),
     ]);
 
     _scheduleFeedbackSubscriptionUpdate(pubkey);
@@ -425,7 +434,6 @@ class EventScheduler {
       throw ArgumentError('Job not found for $pubkey: $jobId');
     }
 
-    final relays = await _deletionRelaysForDvms(pubkey, job.dvmPubkeys);
     final signedDeletion = await _signDeletion(
       pubkey: pubkey,
       eventIds: job.requestEventIds,
@@ -433,7 +441,11 @@ class EventScheduler {
       content: 'cancel',
     );
 
-    await _broadcast.broadcast(signedDeletion, relays: relays, pubkey: pubkey);
+    await _broadcast.broadcast(
+      signedDeletion,
+      relaySet: _deletionRelaySet(pubkey, job.dvmPubkeys),
+      pubkey: pubkey,
+    );
 
     for (final requestEventId in job.requestEventIds) {
       await _store.putTombstone(
@@ -454,7 +466,7 @@ class EventScheduler {
       throw ArgumentError('Package not found for $pubkey: $packageId');
     }
 
-    final relays = await _packageDeletionBroadcastRelays(
+    final relaySet = await _packageDeletionRelaySet(
       pubkey,
       package.requestEventIds,
     );
@@ -465,7 +477,11 @@ class EventScheduler {
       content: 'cancel package',
     );
 
-    await _broadcast.broadcast(signedDeletion, relays: relays, pubkey: pubkey);
+    await _broadcast.broadcast(
+      signedDeletion,
+      relaySet: relaySet,
+      pubkey: pubkey,
+    );
 
     for (final requestEventId in package.requestEventIds) {
       await _store.putTombstone(
@@ -1046,11 +1062,7 @@ class EventScheduler {
         _CreatedJobRequest(
           dvmPubkey: dvmPubkey,
           event: await signer.sign(requestEvent),
-          broadcastRelays: await _requestBroadcastRelays(
-            pubkey,
-            dvmPubkey,
-            dvmReadRelays,
-          ),
+          relaySet: _requestRelaySet(pubkey, dvmPubkey, dvmReadRelays),
         ),
       );
     }
@@ -1121,40 +1133,30 @@ class EventScheduler {
     return userRelayList?.writeUrls.toList() ?? [];
   }
 
-  Future<List<String>> _requestBroadcastRelays(
+  /// Where a kind:5905 request goes: the account's own relays plus the read
+  /// relays the DVM publishes, with [dvmReadRelays] as a last resort.
+  RelaySet _requestRelaySet(
     String pubkey,
     String dvmPubkey,
     List<String>? dvmReadRelays,
-  ) async {
-    final userRelays = await _userBroadcastRelays(pubkey);
-
-    final dvmRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
-      dvmPubkey,
-    );
-    final resolvedDvmRelays = dvmRelayList?.readUrls.toList() ?? [];
-    final dvmRelays = resolvedDvmRelays.isNotEmpty
-        ? resolvedDvmRelays
-        : (dvmReadRelays ?? []);
-    if (dvmRelays.isEmpty) {
-      throw StateError('No read relays found for DVM $dvmPubkey');
-    }
-
-    return {...userRelays, ...dvmRelays}.toList();
+  ) {
+    return RelaySet.union([
+      RelaySet.nip65(pubkey),
+      RelaySet.fallback([
+        RelaySet.inbox([dvmPubkey]),
+        RelaySet.explicit(dvmReadRelays ?? const []),
+      ]),
+    ]);
   }
 
-  Future<List<String>> _deletionRelaysForDvms(
-    String pubkey,
-    Iterable<String> dvmPubkeys,
-  ) async {
-    final relays = {...await _userBroadcastRelays(pubkey)};
-    for (final dvmPubkey in {...dvmPubkeys}) {
-      if (dvmPubkey.isEmpty) continue;
-      final dvmRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
-        dvmPubkey,
-      );
-      relays.addAll(dvmRelayList?.readUrls ?? const []);
-    }
-    return relays.toList();
+  RelaySet _deletionRelaySet(String pubkey, Iterable<String> dvmPubkeys) {
+    return RelaySet.union([
+      RelaySet.nip65(pubkey),
+      RelaySet.inbox([
+        for (final dvmPubkey in {...dvmPubkeys})
+          if (dvmPubkey.isNotEmpty) dvmPubkey,
+      ]),
+    ]);
   }
 
   Future<String?> _dvmPubkeyForRequestEventId(
@@ -1177,7 +1179,7 @@ class EventScheduler {
     return events.first.getFirstTag('p');
   }
 
-  Future<List<String>> _packageDeletionBroadcastRelays(
+  Future<RelaySet> _packageDeletionRelaySet(
     String pubkey,
     Iterable<String> requestEventIds,
   ) async {
@@ -1190,18 +1192,7 @@ class EventScheduler {
       if (dvmPubkey == null || dvmPubkey.isEmpty) continue;
       dvmPubkeys.add(dvmPubkey);
     }
-    return _deletionRelaysForDvms(pubkey, dvmPubkeys);
-  }
-
-  Future<List<String>> _userBroadcastRelays(String pubkey) async {
-    final userRelayList = await _ndk.userRelayLists.getSingleUserRelayList(
-      pubkey,
-    );
-    final userRelays = userRelayList?.urls.toList() ?? [];
-    if (userRelays.isEmpty) {
-      throw StateError('No user NIP-65 relays found for broadcast');
-    }
-    return userRelays;
+    return _deletionRelaySet(pubkey, dvmPubkeys);
   }
 
   String? _jobIdOf(String payload) {
@@ -1294,11 +1285,11 @@ class _CreatedJob {
 class _CreatedJobRequest {
   final String dvmPubkey;
   final Nip01Event event;
-  final List<String> broadcastRelays;
+  final RelaySet relaySet;
 
   _CreatedJobRequest({
     required this.dvmPubkey,
     required this.event,
-    required this.broadcastRelays,
+    required this.relaySet,
   });
 }

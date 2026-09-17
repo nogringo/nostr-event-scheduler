@@ -1,3 +1,21 @@
+## 0.5.0
+
+- **Breaking**: require `ndk: ^0.10.0-dev.1` and
+  `broadcast_queue_shim_for_ndk: ^0.6.0`.
+- **Breaking**: the `OfflineBroadcast` given to `EventScheduler` must be able
+  to resolve relay lists, so build it with `OfflineBroadcast.withNdk` or pass
+  it a `relayListFn`. The scheduler no longer resolves relay URLs itself: it
+  describes where each event goes as a `RelaySet` and lets the shim's worker
+  resolve it, offline included. The `kind:5905` requests target
+  `union(nip65(account), fallback(inbox(dvm), dvmReadRelays))`, the
+  `kind:31234` manifest `nip65(account)`, and the `kind:5` deletions
+  `union(nip65(account), inbox(dvms))`.
+- `schedule` and `schedulePackage` no longer throw when the account's NIP-65
+  or a DVM's relay list cannot be read right now; the requests are queued and
+  delivered once the lists resolve. `dvmReadRelays` keeps its meaning, a
+  fallback for a DVM whose NIP-65 lists no read relay. The relays carried in
+  the encrypted payload are unchanged.
+
 ## 0.4.1
 
 - Widen the `ndk` constraint to `>=0.9.0 <0.11.0` so the 0.10.x line resolves.
