@@ -1,7 +1,13 @@
 ## 0.5.0
 
-- **Breaking**: require `ndk: ^0.10.0-dev.1` and
-  `broadcast_queue_shim_for_ndk: ^0.6.0`.
+- **Breaking**: `EventScheduler` takes a caller-owned `syncEngine`. History
+  comes from `sync_engine_shim_for_ndk` instead of the broken
+  `ndk.fetchedRanges`, so `fetchedRangesEnabled` is no longer needed. The NDK
+  subscriptions stay for real time, and both they and the sync requests now
+  authenticate as the account they act for.
+- **Breaking**: require `ndk: ^0.10.0-dev.1`,
+  `broadcast_queue_shim_for_ndk: ^0.6.0` and
+  `sync_engine_shim_for_ndk: ^0.7.0`.
 - **Breaking**: the `OfflineBroadcast` given to `EventScheduler` must be able
   to resolve relay lists, so build it with `OfflineBroadcast.withNdk` or pass
   it a `relayListFn`. The scheduler no longer resolves relay URLs itself: it

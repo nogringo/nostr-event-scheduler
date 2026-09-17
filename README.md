@@ -24,6 +24,7 @@ import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
 import 'package:sembast/sembast_io.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 Future<void> main() async {
   final db = await databaseFactoryIo.openDatabase('scheduler.db');
@@ -34,16 +35,21 @@ Future<void> main() async {
     NdkConfig(
       eventVerifier: Bip340EventVerifier(),
       cache: SembastCacheManager(db),
-      fetchedRangesEnabled: true,
     ),
   );
 
   final broadcast = OfflineBroadcast.withNdk(ndk, db: db);
   broadcast.start();
 
+  // Caller-owned and shareable: the scheduler declares its own sync requests
+  // and only ever forgets those.
+  final syncEngine = SyncEngine(ndk, db: db);
+  syncEngine.start();
+
   final scheduler = EventScheduler(
     ndk: ndk,
     broadcast: broadcast,
+    syncEngine: syncEngine,
     db: db,
   );
 
@@ -182,7 +188,7 @@ Every method takes the account it acts for. The signer is resolved from `ndk.acc
 |--------|-------------|
 | `startListening({pubkey})` | Starts network subscriptions for one account's sync and DVM feedbacks |
 | `stopListening({pubkey})` | Stops one account's subscriptions, or all of them when omitted |
-| `resync({pubkey})` | Forces a manual resync of schedule requests, deletions, and feedbacks |
+| `resync({pubkey})` | Pull to refresh: fetches now, however fresh the sync engine's coverage is |
 | `decryptPending({pubkey})` | Decrypts what was queued while the account's signer was unavailable |
 | `schedule(event, dvmPubkeys, {pubkey, at, relays, dvmReadRelays})` | Creates one scheduled job through one or more DVMs |
 | `schedulePackage(items, {content, pubkey})` | Creates a logical schedule backed by multiple DVM jobs |
@@ -219,6 +225,8 @@ The package follows a strict **raw vs computed** architecture:
 - **Computed** holds the projections (jobs, packages, and the pending decryption queue), in **Sembast**, each record tagged with its owning account.
 
 A schema change therefore needs no migration script: the projections are dropped and recomputed from raw, per account and lazily, without network access or user action. This does mean the host must give `Ndk` a **persistent** `CacheManager`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
+
+Raw is filled from two sides. `sync_engine_shim_for_ndk` walks the history and keeps the NDK cache in step with the relays, tracking its own coverage per relay and per account, while the NDK subscriptions carry what is happening right now. `clearLocalAccountData` and `clearAllLocalData` forget the scheduler's coverage along with the events, since a cache emptied under a coverage that survived is never fetched again.
 
 ## Testing
 

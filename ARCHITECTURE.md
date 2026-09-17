@@ -41,7 +41,7 @@ The NDK maintains its own persistent cache of Nostr events. The scheduler does *
 - `kind:5` (deletions / cancellations)
 - `kind:7000` (DVM feedbacks)
 
-Because recomputing reads this cache, the host **must** give `Ndk` a persistent `CacheManager`: with an in-memory one, projections cannot survive a restart. Everything the scheduler creates is written there explicitly (`cache.saveEvent`) rather than waiting for the broadcast to succeed, and every subscription and query runs with `cacheWrite: true`, so raw stays complete even when the device is offline for a long time.
+Because recomputing reads this cache, the host **must** give `Ndk` a persistent `CacheManager`: with an in-memory one, projections cannot survive a restart. Everything the scheduler creates is written there explicitly (`cache.saveEvent`) rather than waiting for the broadcast to succeed, every subscription runs with `cacheWrite: true`, and the sync engine writes there what it fetches, so raw stays complete even when the device is offline for a long time.
 
 ### Sembast Stores
 
@@ -201,7 +201,7 @@ Future<void> resync({required String pubkey});
 
 - `startListening()`: Starts real-time NDK subscriptions for one account: multi-device sync (`kind:5905`, `kind:31234`, `kind:5`) and DVM feedbacks (`kind:7000`). Triggers an initial `resync()`. Each listened account costs its own subscriptions, so only start the ones actually in use.
 - `stopListening()`: Closes the subscriptions of one account, or of every account when `pubkey` is omitted. The scheduler remains fully usable offline.
-- `resync()`: Forces a manual network fetch for one account. Uses `ndk.fetchedRanges` to avoid re-downloading already-known data.
+- `resync()`: Pull to refresh for one account. The sync engine goes to the relays however fresh its coverage is, then the cache is replayed into the projections.
 
 #### Local Operations
 
@@ -213,7 +213,7 @@ Future<void> clearAllLocalData();
 
 `decryptPending()` processes the `pending_decryption` queue of one account. For each event ID, it reads the raw event from the NDK cache, attempts decryption, and on success stores the payload in `decrypted_payloads` and updates the projections.
 
-`clearLocalAccountData()` removes every local trace of one account: its projections, the raw records derived from its events, its scheduler events in the NDK cache, and the fetched ranges that would refill them. Listening for that account is stopped first. Cancelled requests are hidden from `loadEvents` by the cache visibility rules, so their ids are recovered from the `e` tags of the account's `kind:5` deletions. Those deletions are themselves left in the cache: they are generic, and dropping them would resurrect cancelled jobs.
+`clearLocalAccountData()` removes every local trace of one account: its projections, the raw records derived from its events, its scheduler events in the NDK cache, and the sync coverage that would otherwise keep them from being fetched again. Only the scheduler's own filters are forgotten: the engine is shared, so wiping everything it persisted is the host's call. Listening for that account is stopped first. Cancelled requests are hidden from `loadEvents` by the cache visibility rules, so their ids are recovered from the `e` tags of the account's `kind:5` deletions. Those deletions are themselves left in the cache: they are generic, and dropping them would resurrect cancelled jobs.
 
 This is a local reset, not a protocol-level forget. The requests still live on the relays, so an account whose signer is still loaded rebuilds them on its next `resync()`. Use `cancel()` to actually retract a schedule.
 
@@ -279,13 +279,18 @@ Private Sembast wrapper around the six stores. Handles JSON serialization, the r
 
 ### Multi-device Sync
 
-When `startListening()` or `resync()` is called for an account, the scheduler:
+History and real time come from two different mechanisms. `sync_engine_shim_for_ndk` walks the history: the scheduler declares two requests per account and the engine paginates, tracks its coverage per relay and per `authPubkey`, and fills the NDK cache. The NDK subscriptions carry what is happening now, which the engine does not do (it polls, it does not subscribe).
 
-1. Queries the network for `kind:5905` authored by that account, using `ndk.fetchedRanges` to only request missing time ranges.
-2. Queries the network for `kind:31234` and `kind:5` authored by that account (same optimization).
-3. Queries the network for `kind:7000` filtered by `#r` tags (the account's known job IDs).
+The two declared requests are:
 
-For each received event:
+1. `{authors: [pubkey], kinds: [5905, 31234, 5]}`, on the account's NIP-65 write relays.
+2. `{kinds: [7000], #r: [job ids]}`, on the NIP-65 write relays of the DVMs of the account's jobs, a feedback carrying no `p` tag to route on. The job ids identify the request, so a new job means releasing that handle and declaring the new one.
+
+Both name the account in `authPubkey`, so they authenticate under it (NIP-42) and their coverage is filed under it. The NDK subscriptions carry the same identity through `RelayAuth.require`. Relay lists that resolve to nothing fall back to `ndk.config.bootstrapRelays`.
+
+The engine returns handles and statuses, never events, so anything it lands in the cache reaches the projections only by replaying that cache: on every page that carried events, and on every `resync()`. Replaying is safe to repeat, and a feedback whose payload is already decrypted is re-applied without emitting a `StatusUpdate` a second time.
+
+For each event, whether replayed from the cache or received live:
 - `kind:5905`: Try to decrypt immediately. If the signer is available, store in `decrypted_payloads` and update/create the job in `jobs`. Requests sharing a `job_id` merge into one job, one `ScheduledJobRequest` per `kind:5905`. If the signer is unavailable, queue in `pending_decryption`.
 - `kind:5`: Store in `tombstones`. Remove the tombstoned request from its job; remove the job once its last request is gone.
 - `kind:7000`: Try to decrypt with the ephemeral public key. The feedback is attributed to one of the job's requests by the event's signature pubkey (the DVM signs feedbacks with its main key). A feedback signed by a pubkey that is not one of the job's DVMs is ignored. Update that request's status and emit a `StatusUpdate`.

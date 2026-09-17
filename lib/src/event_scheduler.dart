@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart' hide RelaySet;
 import 'package:sembast/sembast.dart' as sembast;
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 import 'kinds.dart';
 import 'models/job_status.dart';
@@ -32,10 +33,15 @@ import 'scheduler_store.dart';
 class EventScheduler {
   final Ndk _ndk;
   final OfflineBroadcast _broadcast;
+  final SyncEngine _syncEngine;
   final SchedulerStore _store;
 
   final Map<String, _AccountSync> _sync = {};
+  final Map<String, _AccountDeclaration> _declarations = {};
+  final Map<String, Timer> _feedbackTimers = {};
+  final Map<String, Future<void>> _declareLocks = {};
   final Map<String, Future<void>> _building = {};
+  final Map<String, Future<void>> _replaying = {};
 
   final _statusController = StreamController<StatusUpdate>.broadcast();
   final _syncController = StreamController<SyncState>.broadcast();
@@ -46,9 +52,15 @@ class EventScheduler {
   /// able to resolve relay lists, so build it with [OfflineBroadcast.withNdk]
   /// or pass a `relayListFn`: the scheduler targets NIP-65 relay lists rather
   /// than fixed URLs.
+  ///
+  /// The [SyncEngine] must be started too. It is caller-owned and may be
+  /// shared with the rest of the app: the scheduler declares its own requests
+  /// and only ever forgets those. Disposing the engine, or clearing everything
+  /// it persisted, is the caller's call.
   EventScheduler({
     required this._ndk,
     required this._broadcast,
+    required this._syncEngine,
     required sembast.Database db,
   }) : _store = SchedulerStore(db);
 
@@ -83,6 +95,9 @@ class EventScheduler {
     try {
       await _ensureBuilt(pubkey);
 
+      await _holdSync(pubkey);
+      state.syncHeld = true;
+
       for (final kind in [
         kindScheduleRequest,
         kindPackageManifest,
@@ -91,6 +106,7 @@ class EventScheduler {
         final response = _ndk.requests.subscription(
           filter: Filter(authors: [pubkey], kinds: [kind]),
           cacheWrite: true,
+          auth: _authOf(pubkey),
         );
         state.responses.add(response);
         state.subscriptions.add(response.stream.listen(_onRawEvent));
@@ -102,7 +118,7 @@ class EventScheduler {
       rethrow;
     }
 
-    _scheduleFeedbackSubscriptionUpdate(pubkey);
+    _scheduleFeedbackUpdate(pubkey);
     await resync(pubkey: pubkey);
   }
 
@@ -115,62 +131,43 @@ class EventScheduler {
       }
       return;
     }
-    await _sync.remove(pubkey)?.dispose(_ndk);
+
+    final state = _sync.remove(pubkey);
+    if (state == null) return;
+
+    _feedbackTimers.remove(pubkey)?.cancel();
+    await state.dispose(_ndk);
+    if (state.syncHeld) await _releaseSync(pubkey);
   }
 
   /// Forces a manual resync of [pubkey]'s schedule requests, deletions, and
   /// feedbacks.
+  ///
+  /// This is the pull to refresh gesture: the sync engine goes to the relays
+  /// however fresh its coverage is, where it otherwise revisits on its own.
   /// A failure is reported on [syncState] rather than thrown: losing the
   /// network is expected, and the local state stays usable.
   Future<void> resync({required String pubkey}) async {
-    _syncController.add(SyncState(pubkey: pubkey, status: SyncStatus.syncing));
-
     try {
       await _ensureBuilt(pubkey);
-
-      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      for (final kind in [
-        kindScheduleRequest,
-        kindPackageManifest,
-        kindDeletion,
-      ]) {
-        await _queryWithFetchedRanges(
-          Filter(authors: [pubkey], kinds: [kind]),
-          0,
-          now,
-          _onRawEvent,
-        );
-      }
-
-      final jobIds = (await _store.listJobs(
-        pubkey,
-      )).map((j) => j.jobId).toList();
-      if (jobIds.isNotEmpty) {
-        await _queryWithFetchedRanges(
-          _feedbackFilter(jobIds),
-          0,
-          now,
-          _onRawEvent,
-        );
-      }
+      await _holdSync(pubkey);
     } catch (e) {
-      _syncController.add(
-        SyncState(
-          pubkey: pubkey,
-          status: SyncStatus.error,
-          error: e.toString(),
-        ),
-      );
+      _emitSyncError(pubkey, e);
       return;
     }
 
-    _syncController.add(
-      SyncState(
-        pubkey: pubkey,
-        status: SyncStatus.synced,
-        lastSyncAt: DateTime.now(),
-      ),
-    );
+    try {
+      final declared = _declarations[pubkey]?.requests.toList() ?? [];
+      for (final request in declared) {
+        await _syncEngine.refresh(request.handle);
+      }
+      await _replay(pubkey);
+      _emitSyncState(pubkey);
+    } catch (e) {
+      _emitSyncError(pubkey, e);
+    } finally {
+      await _releaseSync(pubkey);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -191,7 +188,8 @@ class EventScheduler {
 
   /// Removes every local trace of [pubkey]: its projections, the decrypted
   /// payloads and tombstones derived from its events, its scheduler events in
-  /// the NDK cache, and the fetched ranges that would refill them.
+  /// the NDK cache, and the sync coverage that would keep them from being
+  /// fetched again.
   ///
   /// Listening for [pubkey] is stopped first. This is a local reset, not a
   /// protocol-level forget: the requests still live on the relays, so an
@@ -243,12 +241,15 @@ class EventScheduler {
     if (feedbackIds.isNotEmpty) {
       await _ndk.config.cache.removeEvents(ids: feedbackIds);
     }
-    await _clearFetchedRanges(pubkey, jobIds.toList());
+    await _forgetCoverage(pubkey, jobIds.toList());
   }
 
   /// Removes every local trace of every account, unattributed records
   /// included. See [clearLocalAccountData] for what a local reset does and
   /// does not guarantee.
+  ///
+  /// Only the scheduler's own sync coverage is forgotten: the engine is shared,
+  /// so wiping everything it persisted is the caller's call.
   Future<void> clearAllLocalData() async {
     final pubkeys = {
       ..._sync.keys,
@@ -267,7 +268,7 @@ class EventScheduler {
       kinds: [kindScheduleRequest, kindPackageManifest, kindFeedback],
     );
     for (final entry in jobIdsByPubkey.entries) {
-      await _clearFetchedRanges(entry.key, entry.value);
+      await _forgetCoverage(entry.key, entry.value);
     }
   }
 
@@ -325,7 +326,7 @@ class EventScheduler {
           pubkey: pubkey,
         ),
     ]);
-    _scheduleFeedbackSubscriptionUpdate(pubkey);
+    _scheduleFeedbackUpdate(pubkey);
 
     return created.job;
   }
@@ -417,7 +418,7 @@ class EventScheduler {
       ),
     ]);
 
-    _scheduleFeedbackSubscriptionUpdate(pubkey);
+    _scheduleFeedbackUpdate(pubkey);
 
     return package;
   }
@@ -557,9 +558,22 @@ class EventScheduler {
   // Lifecycle
   // --------------------------------------------------------------------------
 
-  /// Disposes all resources.
+  /// Disposes all resources. The sync engine is caller-owned and outlives this.
   Future<void> dispose() async {
     await stopListening();
+
+    for (final timer in _feedbackTimers.values) {
+      timer.cancel();
+    }
+    _feedbackTimers.clear();
+
+    // A resync still in flight holds declarations of its own.
+    for (final declaration in _declarations.values.toList()) {
+      await declaration.dispose(_syncEngine);
+    }
+    _declarations.clear();
+    _declareLocks.clear();
+
     await _statusController.close();
     await _syncController.close();
   }
@@ -598,7 +612,25 @@ class EventScheduler {
     if (!await _store.needsRebuild(pubkey)) return;
 
     await _store.clearComputed(pubkey);
+    await _replayFromCache(pubkey);
+    await _store.markBuilt(pubkey);
+  }
 
+  /// Serializes [pubkey]'s replays: two passes walking the same cache would
+  /// race on the projections they both rebuild.
+  Future<void> _replay(String pubkey) {
+    final pass = (_replaying[pubkey] ?? Future<void>.value()).then(
+      (_) => _replayFromCache(pubkey),
+    );
+    _replaying[pubkey] = pass.then((_) {}, onError: (_) {});
+    return pass;
+  }
+
+  /// Rebuilds [pubkey]'s projections from the events sitting in the NDK cache.
+  ///
+  /// The sync engine hands back handles, never events, so what it lands in the
+  /// cache only reaches the projections through here.
+  Future<void> _replayFromCache(String pubkey) async {
     final requests = await _ndk.config.cache.loadEvents(
       pubKeys: [pubkey],
       kinds: [kindScheduleRequest],
@@ -616,11 +648,23 @@ class EventScheduler {
       await _onRawEvent(event);
     }
 
-    for (final job in await _store.listJobs(pubkey)) {
-      await _applyCachedFeedbacks(job);
+    // Deletions last, so a cancellation landing in the same pass as the
+    // request it retracts still wins.
+    for (final event in await _ndk.config.cache.loadEvents(
+      pubKeys: [pubkey],
+      kinds: [kindDeletion],
+    )) {
+      await _onRawEvent(event);
     }
 
-    await _store.markBuilt(pubkey);
+    final jobIds = (await _store.listJobs(pubkey)).map((j) => j.jobId).toList();
+    if (jobIds.isEmpty) return;
+    for (final event in await _ndk.config.cache.loadEvents(
+      kinds: [kindFeedback],
+      tags: {'r': jobIds},
+    )) {
+      await _onRawEvent(event);
+    }
   }
 
   /// Defers [open] until [pubkey]'s projections are current.
@@ -652,60 +696,223 @@ class EventScheduler {
     return filter;
   }
 
-  Future<void> _queryWithFetchedRanges(
-    Filter filter,
-    int since,
-    int until,
-    Future<void> Function(Nip01Event) handler,
-  ) async {
-    final optimized = await _ndk.fetchedRanges.getOptimizedFilters(
-      filter: filter,
-      since: since,
-      until: until,
-    );
+  Filter _ownFilter(String pubkey) => Filter(
+    authors: [pubkey],
+    kinds: [kindScheduleRequest, kindPackageManifest, kindDeletion],
+  );
 
-    if (optimized.isEmpty) {
-      final response = _ndk.requests.query(
-        filter: filter,
-        cacheRead: true,
-        cacheWrite: true,
+  /// Serializes [pubkey]'s declarations: two of them racing would register the
+  /// same request twice and leave a handle no release can match.
+  Future<void> _declaring(String pubkey, Future<void> Function() body) {
+    final pass = (_declareLocks[pubkey] ?? Future<void>.value()).then(
+      (_) => body(),
+    );
+    _declareLocks[pubkey] = pass.then((_) {}, onError: (_) {});
+    return pass;
+  }
+
+  /// Declares [pubkey]'s sync requests and takes a hold on them. Cheap to call
+  /// again: the engine hands the same handles back.
+  Future<void> _holdSync(String pubkey) =>
+      _declaring(pubkey, () => _holdSyncNow(pubkey));
+
+  Future<void> _holdSyncNow(String pubkey) async {
+    final declaration = _declarations.putIfAbsent(
+      pubkey,
+      _AccountDeclaration.new,
+    );
+    declaration.holders++;
+
+    if (declaration.own == null) {
+      final relays = await _ownSyncRelays(pubkey);
+      declaration.own ??= _register(
+        pubkey,
+        SyncRequest(
+          filters: [_ownFilter(pubkey)],
+          relays: relays,
+          authPubkey: pubkey,
+        ),
       );
-      await for (final event in response.stream) {
-        await handler(event);
-      }
+    }
+    await _declareFeedbackNow(pubkey);
+  }
+
+  Future<void> _releaseSync(String pubkey) =>
+      _declaring(pubkey, () => _releaseSyncNow(pubkey));
+
+  Future<void> _releaseSyncNow(String pubkey) async {
+    final declaration = _declarations[pubkey];
+    if (declaration == null) return;
+
+    declaration.holders--;
+    if (declaration.holders > 0) return;
+
+    _declarations.remove(pubkey);
+    await declaration.dispose(_syncEngine);
+  }
+
+  /// Declares the feedback request of [pubkey], or redeclares it when the jobs
+  /// it follows changed: the job ids are part of what identifies a request, so
+  /// a new set is a new handle rather than an update of the held one.
+  Future<void> _declareFeedbackNow(String pubkey) async {
+    if (_declarations[pubkey] == null) return;
+
+    final jobIds = (await _store.listJobs(pubkey)).map((j) => j.jobId).toList()
+      ..sort();
+    final relays = jobIds.isEmpty
+        ? const <String>[]
+        : await _feedbackSyncRelays(pubkey);
+
+    final declaration = _declarations[pubkey];
+    if (declaration == null) return;
+
+    final existing = declaration.feedback;
+    if (existing != null &&
+        _sameStrings(existing.request.filters.first.tags?['#r'], jobIds) &&
+        _sameStrings(existing.request.relays, relays)) {
       return;
     }
 
-    for (final entry in optimized.entries) {
-      final relay = entry.key;
-      final filters = entry.value;
-      for (final f in filters) {
-        final response = _ndk.requests.query(
-          filter: f,
-          explicitRelays: [relay],
-          cacheRead: true,
-          cacheWrite: true,
-        );
-        await for (final event in response.stream) {
-          await handler(event);
-        }
-      }
+    if (existing != null) {
+      declaration.feedback = null;
+      await existing.dispose(_syncEngine);
     }
+    if (jobIds.isEmpty || relays.isEmpty) return;
+
+    declaration.feedback = _register(
+      pubkey,
+      SyncRequest(
+        filters: [_feedbackFilter(jobIds)],
+        relays: relays,
+        authPubkey: pubkey,
+      ),
+    );
   }
 
-  Future<void> _clearFetchedRanges(String pubkey, List<String> jobIds) async {
-    for (final kind in [
-      kindScheduleRequest,
-      kindPackageManifest,
-      kindDeletion,
-    ]) {
-      await _ndk.fetchedRanges.clearForFilter(
-        Filter(authors: [pubkey], kinds: [kind]),
+  _DeclaredRequest _register(String pubkey, SyncRequest request) {
+    final handle = _syncEngine.ensure(request);
+    late final _DeclaredRequest declared;
+    declared = _DeclaredRequest(
+      handle: handle,
+      request: request,
+      subscription: _syncEngine.watchStatus(handle).listen((status) {
+        _emitSyncState(pubkey);
+
+        final progress = status.progress;
+        if (progress == null || progress.eventCount == 0) return;
+        if (identical(progress, declared.lastProgress)) return;
+        declared.lastProgress = progress;
+        unawaited(_replay(pubkey));
+      }),
+    );
+    return declared;
+  }
+
+  Future<void> _forgetCoverage(String pubkey, List<String> jobIds) async {
+    await _syncEngine.forgetFilter(_ownFilter(pubkey), authPubkey: pubkey);
+    if (jobIds.isEmpty) return;
+    await _syncEngine.forgetFilter(
+      _feedbackFilter(jobIds..sort()),
+      authPubkey: pubkey,
+    );
+  }
+
+  /// Where [pubkey]'s own scheduler events were published.
+  Future<List<String>> _ownSyncRelays(String pubkey) async {
+    final relayList = await _ndk.userRelayLists.getSingleUserRelayList(pubkey);
+    return _orBootstrap(relayList?.writeUrls);
+  }
+
+  /// Where the DVMs of [pubkey]'s jobs publish their kind:7000: their own
+  /// NIP-65 write relays, a feedback carrying no `p` tag to route on.
+  Future<List<String>> _feedbackSyncRelays(String pubkey) async {
+    final dvmPubkeys = {
+      for (final job in await _store.listJobs(pubkey))
+        for (final request in job.requests)
+          if (request.dvmPubkey.isNotEmpty) request.dvmPubkey,
+    };
+
+    final relays = <String>{};
+    for (final dvmPubkey in dvmPubkeys) {
+      final relayList = await _ndk.userRelayLists.getSingleUserRelayList(
+        dvmPubkey,
       );
+      relays.addAll(relayList?.writeUrls ?? const []);
     }
-    if (jobIds.isNotEmpty) {
-      await _ndk.fetchedRanges.clearForFilter(_feedbackFilter(jobIds));
+    return _orBootstrap(relays);
+  }
+
+  List<String> _orBootstrap(Iterable<String>? relays) {
+    final urls = (relays?.toList() ?? [])..sort();
+    return urls.isEmpty ? [..._ndk.config.bootstrapRelays] : urls;
+  }
+
+  bool _sameStrings(Iterable<String>? a, Iterable<String>? b) {
+    final left = a?.toList() ?? const [];
+    final right = b?.toList() ?? const [];
+    if (left.length != right.length) return false;
+    for (var i = 0; i < left.length; i++) {
+      if (left[i] != right[i]) return false;
     }
+    return true;
+  }
+
+  RelayAuth? _authOf(String pubkey) {
+    final account = _ndk.accounts.accounts[pubkey];
+    return account == null ? null : RelayAuth.require(account);
+  }
+
+  void _emitSyncError(String pubkey, Object error) {
+    _syncController.add(
+      SyncState(
+        pubkey: pubkey,
+        status: SyncStatus.error,
+        error: error.toString(),
+      ),
+    );
+  }
+
+  /// Reports [pubkey]'s sync state from the phases of its declared requests,
+  /// so the engine's own passes surface too and not just a manual [resync].
+  void _emitSyncState(String pubkey) {
+    final declaration = _declarations[pubkey];
+    if (declaration == null) return;
+
+    final statuses = [
+      for (final declared in declaration.requests)
+        _syncEngine.status(declared.handle),
+    ];
+    if (statuses.isEmpty) return;
+
+    final failed = statuses
+        .where((s) => s.phase == SyncRequestPhase.failed)
+        .firstOrNull;
+    final SyncState state;
+    if (failed != null) {
+      state = SyncState(
+        pubkey: pubkey,
+        status: SyncStatus.error,
+        error: (failed.lastError ?? 'sync failed').toString(),
+      );
+    } else if (statuses.any((s) => s.phase == SyncRequestPhase.syncing)) {
+      state = SyncState(pubkey: pubkey, status: SyncStatus.syncing);
+    } else if (statuses.every((s) => s.phase == SyncRequestPhase.synced)) {
+      state = SyncState(
+        pubkey: pubkey,
+        status: SyncStatus.synced,
+        lastSyncAt: DateTime.now(),
+      );
+    } else {
+      return;
+    }
+
+    if (declaration.lastStatus == state.status &&
+        declaration.lastError == state.error) {
+      return;
+    }
+    declaration.lastStatus = state.status;
+    declaration.lastError = state.error;
+    _syncController.add(state);
   }
 
   // --------------------------------------------------------------------------
@@ -739,6 +946,9 @@ class EventScheduler {
 
   /// A kind:7000 is signed by the DVM, so it is attributed to an account
   /// through the job its `r` tag points to.
+  ///
+  /// A feedback whose payload is already known was seen before, and replaying
+  /// the cache must not notify a second time for it.
   Future<void> _onFeedbackEvent(Nip01Event event) async {
     final jobId = event.getFirstTag('r');
     if (jobId == null) return;
@@ -746,9 +956,15 @@ class EventScheduler {
     final job = await _store.getJob(jobId);
     if (job == null) return;
 
-    final payload = await _decryptedPayload(event, job.pubkey);
+    final known = await _store.getDecryptedPayload(event.id);
+    final payload = known ?? await _decryptedPayload(event, job.pubkey);
     if (payload == null) return;
-    await _processFeedbackPayload(event, payload, job: job);
+    await _processFeedbackPayload(
+      event,
+      payload,
+      job: job,
+      notify: known == null,
+    );
   }
 
   Future<void> _onDeletionEvent(Nip01Event event) async {
@@ -973,17 +1189,19 @@ class EventScheduler {
   // Internals - Feedback subscription
   // --------------------------------------------------------------------------
 
-  void _scheduleFeedbackSubscriptionUpdate(String pubkey) {
-    final state = _sync[pubkey];
-    if (state == null) return;
-
-    state.feedbackUpdateTimer?.cancel();
-    state.feedbackUpdateTimer = Timer(const Duration(milliseconds: 500), () {
-      _updateFeedbackSubscription(pubkey);
+  void _scheduleFeedbackUpdate(String pubkey) {
+    _feedbackTimers[pubkey]?.cancel();
+    _feedbackTimers[pubkey] = Timer(const Duration(milliseconds: 500), () {
+      _feedbackTimers.remove(pubkey);
+      unawaited(_updateFeedbackTargets(pubkey));
     });
   }
 
-  Future<void> _updateFeedbackSubscription(String pubkey) async {
+  /// Retargets what follows [pubkey]'s jobs after the set of jobs changed: the
+  /// live subscription and, through it, the feedback sync request.
+  Future<void> _updateFeedbackTargets(String pubkey) async {
+    await _declaring(pubkey, () => _declareFeedbackNow(pubkey));
+
     final state = _sync[pubkey];
     if (state == null) return;
 
@@ -995,6 +1213,7 @@ class EventScheduler {
     final response = _ndk.requests.subscription(
       filter: _feedbackFilter(jobIds),
       cacheWrite: true,
+      auth: _authOf(pubkey),
     );
     state.feedbackRequestId = response.requestId;
     state.feedbackSubscription = response.stream.listen(_onRawEvent);
@@ -1242,7 +1461,9 @@ class _AccountSync {
   final List<StreamSubscription<Nip01Event>> subscriptions = [];
   String? feedbackRequestId;
   StreamSubscription<Nip01Event>? feedbackSubscription;
-  Timer? feedbackUpdateTimer;
+
+  /// Whether listening took a hold on the account's sync requests.
+  bool syncHeld = false;
 
   Future<void> dispose(Ndk ndk) async {
     for (final sub in subscriptions) {
@@ -1256,8 +1477,6 @@ class _AccountSync {
     responses.clear();
 
     await closeFeedback(ndk);
-    feedbackUpdateTimer?.cancel();
-    feedbackUpdateTimer = null;
   }
 
   Future<void> closeFeedback(Ndk ndk) async {
@@ -1267,6 +1486,50 @@ class _AccountSync {
     }
     await feedbackSubscription?.cancel();
     feedbackSubscription = null;
+  }
+}
+
+/// Sync requests declared for one account, held until the last holder goes.
+class _AccountDeclaration {
+  int holders = 0;
+  _DeclaredRequest? own;
+  _DeclaredRequest? feedback;
+
+  /// Last state pushed on `syncState`, so a stream of progress pages does not
+  /// repeat it.
+  SyncStatus? lastStatus;
+  String? lastError;
+
+  Iterable<_DeclaredRequest> get requests => [?own, ?feedback];
+
+  Future<void> dispose(SyncEngine engine) async {
+    for (final declared in requests) {
+      await declared.dispose(engine);
+    }
+    own = null;
+    feedback = null;
+  }
+}
+
+/// One registered [SyncRequest], with what it was declared from.
+class _DeclaredRequest {
+  final SyncHandle handle;
+  final SyncRequest request;
+  final StreamSubscription<SyncRequestStatus> subscription;
+
+  /// The last page reconciled, so a status re-emitting it does not replay the
+  /// cache a second time.
+  SyncProgress? lastProgress;
+
+  _DeclaredRequest({
+    required this.handle,
+    required this.request,
+    required this.subscription,
+  });
+
+  Future<void> dispose(SyncEngine engine) async {
+    await subscription.cancel();
+    engine.release(handle);
   }
 }
 

@@ -2,6 +2,7 @@ import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
 import 'package:sembast/sembast_io.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 Future<void> main() async {
   final db = await databaseFactoryIo.openDatabase('scheduler.db');
@@ -12,14 +13,21 @@ Future<void> main() async {
     NdkConfig(
       eventVerifier: Bip340EventVerifier(),
       cache: SembastCacheManager(db),
-      fetchedRangesEnabled: true,
     ),
   );
 
   final broadcast = OfflineBroadcast.withNdk(ndk, db: db);
   broadcast.start();
 
-  final scheduler = EventScheduler(ndk: ndk, broadcast: broadcast, db: db);
+  final syncEngine = SyncEngine(ndk, db: db);
+  syncEngine.start();
+
+  final scheduler = EventScheduler(
+    ndk: ndk,
+    broadcast: broadcast,
+    syncEngine: syncEngine,
+    db: db,
+  );
 
   final pubkey = ndk.accounts.getPublicKey()!;
   await scheduler.startListening(pubkey: pubkey);
@@ -35,6 +43,7 @@ Future<void> main() async {
 
   // Dispose when done
   await scheduler.dispose();
+  await syncEngine.dispose();
   await broadcast.dispose();
   await db.close();
 }

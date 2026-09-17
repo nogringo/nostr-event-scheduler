@@ -14,9 +14,10 @@ import 'package:nostr_event_scheduler/nostr_event_scheduler.dart';
 import 'package:nostr_scheduler_dvm/nostr_scheduler_dvm.dart';
 import 'package:sembast/sembast.dart' as sembast;
 import 'package:sembast/sembast_memory.dart' hide Filter;
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 import 'package:test/test.dart';
 
-Future<EventScheduler> createScheduler({
+Future<(EventScheduler, SyncEngine)> createScheduler({
   required Ndk ndk,
   required Database broadcastDb,
   required Database schedulerDb,
@@ -29,13 +30,17 @@ Future<EventScheduler> createScheduler({
   );
   broadcast.start();
 
+  final syncEngine = SyncEngine(ndk, db: schedulerDb);
+  syncEngine.start();
+
   final scheduler = EventScheduler(
     ndk: ndk,
     broadcast: broadcast,
+    syncEngine: syncEngine,
     db: schedulerDb,
   );
 
-  return scheduler;
+  return (scheduler, syncEngine);
 }
 
 Future<void> _waitFor(
@@ -60,6 +65,7 @@ void main() {
   late Database broadcastDb;
   late Database schedulerDb;
   late EventScheduler scheduler;
+  late SyncEngine syncEngine;
 
   Future<List<Nip01Event>> relayQuery(Filter filter) {
     return ndk.requests
@@ -102,6 +108,67 @@ void main() {
     await ndk.broadcast
         .broadcast(nostrEvent: signedFeedback, specificRelays: [relay.url])
         .broadcastDoneFuture;
+  }
+
+  /// Puts an encrypted kind:5905 on the relay behind the scheduler's back, as
+  /// another device would, and answers its job id.
+  Future<String> publishScheduleRequest({required KeyPair dvm}) async {
+    final targetEvent = Nip01Event(
+      pubKey: clientKey.publicKey,
+      kind: 1,
+      tags: [],
+      content: 'sync test',
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final signedTarget = await ndk.accounts.getLoggedAccount()!.signer.sign(
+      targetEvent,
+    );
+
+    final jobId = List.generate(
+      32,
+      (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+
+    final payload = jsonEncode({
+      'job_id': jobId,
+      'schedule_at': signedTarget.createdAt,
+      'signed_event': {
+        'id': signedTarget.id,
+        'pubkey': signedTarget.pubKey,
+        'created_at': signedTarget.createdAt,
+        'kind': signedTarget.kind,
+        'tags': signedTarget.tags,
+        'content': signedTarget.content,
+        'sig': signedTarget.sig,
+      },
+      'relays': [relay.url],
+    });
+
+    final encrypted = await Nip44.encryptMessage(
+      payload,
+      clientKey.privateKey!,
+      dvm.publicKey,
+    );
+
+    final requestEvent = Nip01Event(
+      pubKey: clientKey.publicKey,
+      kind: 5905,
+      tags: [
+        ['p', dvm.publicKey],
+        ['encrypted'],
+      ],
+      content: encrypted,
+      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    final signedRequest = await ndk.accounts.getLoggedAccount()!.signer.sign(
+      requestEvent,
+    );
+
+    await ndk.broadcast
+        .broadcast(nostrEvent: signedRequest, specificRelays: [relay.url])
+        .broadcastDoneFuture;
+
+    return jobId;
   }
 
   setUp(() async {
@@ -147,7 +214,6 @@ void main() {
         eventVerifier: Bip340EventVerifier(),
         cache: MemCacheManager(),
         bootstrapRelays: [relay.url],
-        fetchedRangesEnabled: true,
       ),
     );
     ndk.accounts.loginPrivateKey(
@@ -163,7 +229,7 @@ void main() {
     schedulerDb = await databaseFactoryMemory.openDatabase(
       'scheduler_test_$dbSuffix.db',
     );
-    scheduler = await createScheduler(
+    (scheduler, syncEngine) = await createScheduler(
       ndk: ndk,
       broadcastDb: broadcastDb,
       schedulerDb: schedulerDb,
@@ -173,6 +239,7 @@ void main() {
 
   tearDown(() async {
     await scheduler.dispose();
+    await syncEngine.dispose();
     await ndk.destroy();
     await relay.stopServer();
     await broadcastDb.close();
@@ -664,7 +731,6 @@ void main() {
           eventVerifier: Bip340EventVerifier(useIsolate: false),
           cache: MemCacheManager(),
           bootstrapRelays: [relay.url],
-          fetchedRangesEnabled: true,
           defaultQueryTimeout: const Duration(seconds: 2),
           defaultBroadcastTimeout: const Duration(seconds: 2),
         ),
@@ -771,7 +837,6 @@ void main() {
             eventVerifier: Bip340EventVerifier(useIsolate: false),
             cache: MemCacheManager(),
             bootstrapRelays: [relay.url],
-            fetchedRangesEnabled: true,
             defaultQueryTimeout: const Duration(seconds: 2),
             defaultBroadcastTimeout: const Duration(seconds: 2),
           ),
@@ -1033,71 +1098,38 @@ void main() {
 
   group('multi-device sync', () {
     test('recovers a kind:5905 from the relay', () async {
-      // Create an encrypted kind:5905 manually and inject it into the relay
-      final targetEvent = Nip01Event(
-        pubKey: clientKey.publicKey,
-        kind: 1,
-        tags: [],
-        content: 'sync test',
-        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      );
-      final signedTarget = await ndk.accounts.getLoggedAccount()!.signer.sign(
-        targetEvent,
-      );
+      final jobId = await publishScheduleRequest(dvm: dvmKey);
 
-      final jobId = List.generate(
-        32,
-        (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0'),
-      ).join();
-
-      final payload = jsonEncode({
-        'job_id': jobId,
-        'schedule_at': signedTarget.createdAt,
-        'signed_event': {
-          'id': signedTarget.id,
-          'pubkey': signedTarget.pubKey,
-          'created_at': signedTarget.createdAt,
-          'kind': signedTarget.kind,
-          'tags': signedTarget.tags,
-          'content': signedTarget.content,
-          'sig': signedTarget.sig,
-        },
-        'relays': [relay.url],
-      });
-
-      final encrypted = await Nip44.encryptMessage(
-        payload,
-        clientKey.privateKey!,
-        dvmKey.publicKey,
-      );
-
-      final requestEvent = Nip01Event(
-        pubKey: clientKey.publicKey,
-        kind: 5905,
-        tags: [
-          ['p', dvmKey.publicKey],
-          ['encrypted'],
-        ],
-        content: encrypted,
-        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      );
-      final signedRequest = await ndk.accounts.getLoggedAccount()!.signer.sign(
-        requestEvent,
-      );
-
-      await ndk.broadcast
-          .broadcast(nostrEvent: signedRequest, specificRelays: [relay.url])
-          .broadcastDoneFuture;
-
-      // Start listening and resync
       await scheduler.startListening(pubkey: clientKey.publicKey);
       await scheduler.resync(pubkey: clientKey.publicKey);
 
-      // Wait for processing
-      await Future.delayed(const Duration(milliseconds: 500));
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
+        return jobs.any((j) => j.jobId == jobId);
+      });
+    });
+
+    test('resync catches up without listening, and notifies once', () async {
+      final jobId = await publishScheduleRequest(dvm: dvmKey);
+
+      final updates = <StatusUpdate>[];
+      final subscription = scheduler.statusUpdates.listen(updates.add);
+      addTearDown(subscription.cancel);
+
+      await scheduler.resync(pubkey: clientKey.publicKey);
 
       final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
       expect(jobs.any((j) => j.jobId == jobId), isTrue);
+
+      await publishFeedback(dvm: dvmKey, jobId: jobId, status: 'scheduled');
+      await scheduler.resync(pubkey: clientKey.publicKey);
+      await _waitFor(() => updates.length == 1);
+
+      // Replaying the cache must not report a feedback already seen.
+      await scheduler.resync(pubkey: clientKey.publicKey);
+      await Future.delayed(const Duration(milliseconds: 300));
+      expect(updates.length, 1);
+      expect(updates.single.jobId, jobId);
     });
   });
 
