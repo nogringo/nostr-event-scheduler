@@ -11,7 +11,7 @@ This package implements the Scheduler DVM protocol and provides a robust, offlin
 - **Offline signer support** - Works even when your signer (e.g. NIP-46) is temporarily unavailable
 - **Multi-device sync** - Automatically syncs scheduled jobs across devices
 - **Redundant scheduling** - Send the same job to several Scheduler DVMs (one kind:5905 per DVM, same job_id) so publishing does not depend on a single DVM's uptime or policy
-- **Scheduled packages** - Group several DVM jobs into one logical schedule with private display context
+- **Scheduled packages** - Group several DVM jobs into one logical schedule with private display context, written to and read from your NIP-37 private relays when you publish a kind:10013
 - **Real-time DVM feedback** - Receives status updates from Scheduler DVMs (`scheduled`, `published`, `failed`, etc.)
 - **No raw event duplication** - Relies on the NDK persistent cache for raw events; only stores decrypted payloads, tombstones and projections in Sembast
 - **No migrations** - A schema change drops the projections and recomputes them from raw, offline

@@ -57,6 +57,17 @@ class EventScheduler {
   /// shared with the rest of the app: the scheduler declares its own requests
   /// and only ever forgets those. Disposing the engine, or clearing everything
   /// it persisted, is the caller's call.
+  ///
+  /// Reading an account's NIP-37 private relays is the caller's job in one
+  /// respect: the scheduler only ever looks for its kind:10013 in the NDK
+  /// cache, never on a relay. Fetch it like any other relay list of the
+  /// account, at login or alongside its NIP-65, and manifests are read from
+  /// the private relays as soon as it lands. Without it they are read from the
+  /// NIP-65 relays only, which is correct but blind to another device's
+  /// private manifests.
+  ///
+  /// Writing needs nothing: [OfflineBroadcast] resolves the list itself, and
+  /// leaves it in the NDK cache for the read side to find.
   EventScheduler({
     required this._ndk,
     required this._broadcast,
@@ -105,6 +116,18 @@ class EventScheduler {
       ]) {
         final response = _ndk.requests.subscription(
           filter: Filter(authors: [pubkey], kinds: [kind]),
+          cacheWrite: true,
+          auth: _authOf(pubkey),
+        );
+        state.responses.add(response);
+        state.subscriptions.add(response.stream.listen(_onRawEvent));
+      }
+
+      final privateRelays = await _privateSyncRelays(pubkey);
+      if (privateRelays.isNotEmpty) {
+        final response = _ndk.requests.subscription(
+          filter: _manifestFilter(pubkey),
+          explicitRelays: privateRelays,
           cacheWrite: true,
           auth: _authOf(pubkey),
         );
@@ -413,7 +436,7 @@ class EventScheduler {
         ),
       _broadcast.broadcast(
         signedManifest,
-        relaySet: RelaySet.nip65(pubkey),
+        relaySet: _manifestRelaySet(pubkey),
         pubkey: pubkey,
       ),
     ]);
@@ -467,33 +490,49 @@ class EventScheduler {
       throw ArgumentError('Package not found for $pubkey: $packageId');
     }
 
-    final relaySet = await _packageDeletionRelaySet(
-      pubkey,
-      package.requestEventIds,
-    );
-    final signedDeletion = await _signDeletion(
+    // Two deletions rather than one: the DVMs must see the requests retracted
+    // on their inbox relays, where a deletion tagging them all would reveal the
+    // package and its size.
+    if (package.requestEventIds.isNotEmpty) {
+      final requestDeletion = await _signDeletion(
+        pubkey: pubkey,
+        eventIds: package.requestEventIds,
+        kinds: const [kindScheduleRequest],
+        content: 'cancel package',
+      );
+      await _broadcast.broadcast(
+        requestDeletion,
+        relaySet: await _packageDeletionRelaySet(
+          pubkey,
+          package.requestEventIds,
+        ),
+        pubkey: pubkey,
+      );
+
+      for (final requestEventId in package.requestEventIds) {
+        await _store.putTombstone(
+          requestEventId,
+          deletionEventId: requestDeletion.id,
+        );
+        await _removeRequestFromJobs(requestEventId, pubkey);
+      }
+    }
+
+    final manifestDeletion = await _signDeletion(
       pubkey: pubkey,
-      eventIds: [...package.requestEventIds, package.manifestEventId],
-      kinds: const [kindScheduleRequest, kindPackageManifest],
+      eventIds: [package.manifestEventId],
+      kinds: const [kindPackageManifest],
       content: 'cancel package',
     );
-
     await _broadcast.broadcast(
-      signedDeletion,
-      relaySet: relaySet,
+      manifestDeletion,
+      relaySet: _manifestRelaySet(pubkey),
       pubkey: pubkey,
     );
 
-    for (final requestEventId in package.requestEventIds) {
-      await _store.putTombstone(
-        requestEventId,
-        deletionEventId: signedDeletion.id,
-      );
-      await _removeRequestFromJobs(requestEventId, pubkey);
-    }
     await _store.putTombstone(
       package.manifestEventId,
-      deletionEventId: signedDeletion.id,
+      deletionEventId: manifestDeletion.id,
     );
     await _store.removePackage(package.packageId);
   }
@@ -701,6 +740,12 @@ class EventScheduler {
     kinds: [kindScheduleRequest, kindPackageManifest, kindDeletion],
   );
 
+  /// The manifest branch, read on the private relays. [_ownFilter] still reads
+  /// kind:31234 on the NIP-65 relays, for the manifests written before the
+  /// account had a kind:10013, or by a client without NIP-37.
+  Filter _manifestFilter(String pubkey) =>
+      Filter(authors: [pubkey], kinds: [kindPackageManifest, kindDeletion]);
+
   /// Serializes [pubkey]'s declarations: two of them racing would register the
   /// same request twice and leave a handle no release can match.
   Future<void> _declaring(String pubkey, Future<void> Function() body) {
@@ -733,6 +778,19 @@ class EventScheduler {
           authPubkey: pubkey,
         ),
       );
+    }
+    if (declaration.manifests == null) {
+      final relays = await _privateSyncRelays(pubkey);
+      if (relays.isNotEmpty) {
+        declaration.manifests = _register(
+          pubkey,
+          SyncRequest(
+            filters: [_manifestFilter(pubkey)],
+            relays: relays,
+            authPubkey: pubkey,
+          ),
+        );
+      }
     }
     await _declareFeedbackNow(pubkey);
   }
@@ -810,6 +868,7 @@ class EventScheduler {
 
   Future<void> _forgetCoverage(String pubkey, List<String> jobIds) async {
     await _syncEngine.forgetFilter(_ownFilter(pubkey), authPubkey: pubkey);
+    await _syncEngine.forgetFilter(_manifestFilter(pubkey), authPubkey: pubkey);
     if (jobIds.isEmpty) return;
     await _syncEngine.forgetFilter(
       _feedbackFilter(jobIds..sort()),
@@ -821,6 +880,69 @@ class EventScheduler {
   Future<List<String>> _ownSyncRelays(String pubkey) async {
     final relayList = await _ndk.userRelayLists.getSingleUserRelayList(pubkey);
     return _orBootstrap(relayList?.writeUrls);
+  }
+
+  /// [pubkey]'s NIP-37 private relays, where its manifests go. Empty when the
+  /// NDK cache holds no kind:10013 for it, or when no signer can open the one
+  /// it holds.
+  ///
+  /// The cache is the only source, so this costs nothing and is re-read on
+  /// every declaration: a list that lands in the cache is used at once,
+  /// whoever put it there. Keeping it there is the caller's job, see
+  /// [EventScheduler.new].
+  Future<List<String>> _privateSyncRelays(String pubkey) async {
+    final lists = await _ndk.config.cache.loadEvents(
+      pubKeys: [pubkey],
+      kinds: [kindPrivateRelays],
+    );
+    if (lists.isEmpty) return const [];
+
+    final list = lists.reduce((a, b) => b.createdAt > a.createdAt ? b : a);
+    if (list.content.isEmpty) return const [];
+
+    final payloads = _ndk.decryptedEventPayloads;
+    var plaintext = await payloads.loadCachedPlaintext(
+      eventId: list.id,
+      viewerPubKey: pubkey,
+    );
+    if (plaintext == null) {
+      final signer = _signerOrNull(pubkey);
+      if (signer == null) return const [];
+      try {
+        plaintext = await payloads.loadOrDecrypt(
+          event: list,
+          viewerPubKey: pubkey,
+          scheme: DecryptedPayloadScheme.nip44,
+          decrypt: () => signer.decryptNip44(
+            ciphertext: list.content,
+            senderPubKey: list.pubKey,
+          ),
+        );
+      } catch (_) {
+        return const [];
+      }
+    }
+    return plaintext == null ? const [] : _relaysOfPrivateTags(plaintext);
+  }
+
+  /// Relay URLs of the decrypted tags of a kind:10013. Anything that is not a
+  /// JSON list of tags yields no relay.
+  List<String> _relaysOfPrivateTags(String plaintext) {
+    final Object? tags;
+    try {
+      tags = jsonDecode(plaintext);
+    } on FormatException {
+      return const [];
+    }
+    if (tags is! List) return const [];
+    return [
+      for (final tag in tags)
+        if (tag is List &&
+            tag.length >= 2 &&
+            tag[0] == 'relay' &&
+            tag[1] is String)
+          tag[1] as String,
+    ]..sort();
   }
 
   /// Where the DVMs of [pubkey]'s jobs publish their kind:7000: their own
@@ -1368,6 +1490,16 @@ class EventScheduler {
     ]);
   }
 
+  /// Where a kind:31234 manifest and the kind:5 retracting it go: the NIP-37
+  /// private relays of [pubkey], or its NIP-65 when it publishes none. One set
+  /// and never both, so a public relay never learns a package exists.
+  RelaySet _manifestRelaySet(String pubkey) {
+    return RelaySet.fallback([
+      RelaySet.private(pubkey),
+      RelaySet.nip65(pubkey),
+    ]);
+  }
+
   RelaySet _deletionRelaySet(String pubkey, Iterable<String> dvmPubkeys) {
     return RelaySet.union([
       RelaySet.nip65(pubkey),
@@ -1493,6 +1625,7 @@ class _AccountSync {
 class _AccountDeclaration {
   int holders = 0;
   _DeclaredRequest? own;
+  _DeclaredRequest? manifests;
   _DeclaredRequest? feedback;
 
   /// Last state pushed on `syncState`, so a stream of progress pages does not
@@ -1500,13 +1633,14 @@ class _AccountDeclaration {
   SyncStatus? lastStatus;
   String? lastError;
 
-  Iterable<_DeclaredRequest> get requests => [?own, ?feedback];
+  Iterable<_DeclaredRequest> get requests => [?own, ?manifests, ?feedback];
 
   Future<void> dispose(SyncEngine engine) async {
     for (final declared in requests) {
       await declared.dispose(engine);
     }
     own = null;
+    manifests = null;
     feedback = null;
   }
 }

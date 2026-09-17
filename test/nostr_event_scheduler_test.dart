@@ -67,16 +67,25 @@ void main() {
   late EventScheduler scheduler;
   late SyncEngine syncEngine;
 
-  Future<List<Nip01Event>> relayQuery(Filter filter) {
+  Future<List<Nip01Event>> relayQueryOn(MockRelay target, Filter filter) {
     return ndk.requests
         .query(
           filter: filter,
-          explicitRelays: [relay.url],
+          explicitRelays: [target.url],
           cacheRead: false,
           cacheWrite: false,
         )
         .future;
   }
+
+  Future<List<Nip01Event>> relayQuery(Filter filter) =>
+      relayQueryOn(relay, filter);
+
+  // The shim resolves relay sets in the background, so a clear racing the
+  // first attempt would see the request written back to the NDK cache.
+  Future<void> waitForRequestsOnRelay(int count) => _waitFor(
+    () async => (await relayQuery(Filter(kinds: [5905]))).length >= count,
+  );
 
   Future<void> publishFeedback({
     required KeyPair dvm,
@@ -1002,12 +1011,24 @@ void main() {
       final deletions = await relayQuery(
         Filter(kinds: [5], authors: [clientKey.publicKey]),
       );
-      final deletion = deletions.singleWhere(
+      final manifestDeletion = deletions.singleWhere(
         (event) => event.getTags('e').contains(package.manifestEventId),
       );
-      expect(deletion.getTags('e'), containsAll(package.requestEventIds));
-      expect(deletion.getTags('e'), contains(package.manifestEventId));
-      expect(deletion.getTags('k'), containsAll(['5905', '31234']));
+      expect(manifestDeletion.getTags('e'), [package.manifestEventId]);
+      expect(manifestDeletion.getTags('k'), ['31234']);
+
+      final requestDeletion = deletions.singleWhere(
+        (event) => event.getTags('e').contains(package.requestEventIds.first),
+      );
+      expect(
+        requestDeletion.getTags('e'),
+        containsAll(package.requestEventIds),
+      );
+      expect(
+        requestDeletion.getTags('e'),
+        isNot(contains(package.manifestEventId)),
+      );
+      expect(requestDeletion.getTags('k'), ['5905']);
       expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
       expect(
         await scheduler.listPackages(pubkey: clientKey.publicKey),
@@ -1078,12 +1099,20 @@ void main() {
         final deletions = await relayQuery(
           Filter(kinds: [5], authors: [clientKey.publicKey]),
         );
-        final deletion = deletions.singleWhere(
+        final manifestDeletion = deletions.singleWhere(
           (event) => event.getTags('e').contains(package.manifestEventId),
         );
-        expect(deletion.getTags('e'), containsAll(package.requestEventIds));
-        expect(deletion.getTags('e'), contains(package.manifestEventId));
-        expect(deletion.getTags('k'), containsAll(['5905', '31234']));
+        expect(manifestDeletion.getTags('e'), [package.manifestEventId]);
+        expect(manifestDeletion.getTags('k'), ['31234']);
+
+        final requestDeletion = deletions.singleWhere(
+          (event) => event.getTags('e').contains(package.requestEventIds.first),
+        );
+        expect(
+          requestDeletion.getTags('e'),
+          containsAll(package.requestEventIds),
+        );
+        expect(requestDeletion.getTags('k'), ['5905']);
         expect(
           await scheduler.listPackages(pubkey: clientKey.publicKey),
           isEmpty,
@@ -1130,6 +1159,265 @@ void main() {
       await Future.delayed(const Duration(milliseconds: 300));
       expect(updates.length, 1);
       expect(updates.single.jobId, jobId);
+    });
+  });
+
+  group('NIP-37 private relays', () {
+    late MockRelay privateRelay;
+
+    Future<ScheduledPackage> schedulePackageOfTwo(String content) async {
+      final signer = ndk.accounts.getLoggedAccount()!.signer;
+      final items = <SchedulePackageItem>[];
+      for (final label in ['first', 'second']) {
+        final signed = await signer.sign(
+          Nip01Event(
+            pubKey: clientKey.publicKey,
+            kind: 1,
+            tags: [],
+            content: '$content $label',
+            createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          ),
+        );
+        items.add(
+          SchedulePackageItem(
+            event: signed,
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        );
+      }
+      return scheduler.schedulePackage(
+        items,
+        content: content,
+        pubkey: clientKey.publicKey,
+      );
+    }
+
+    /// Publishes the account's kind:10013 pointing at [privateRelay].
+    Future<void> publishPrivateRelayList() async {
+      final encrypted = await Nip44.encryptMessage(
+        jsonEncode([
+          ['relay', privateRelay.url],
+        ]),
+        clientKey.privateKey!,
+        clientKey.publicKey,
+      );
+      final list = Nip01Utils.signWithPrivateKey(
+        event: Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 10013,
+          tags: [],
+          content: encrypted,
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+        privateKey: clientKey.privateKey!,
+      );
+      await ndk.broadcast
+          .broadcast(nostrEvent: list, specificRelays: [relay.url])
+          .broadcastDoneFuture;
+    }
+
+    setUp(() async {
+      privateRelay = MockRelay(name: 'private relay', explicitPort: 9091);
+      await privateRelay.startServer();
+    });
+
+    tearDown(() => privateRelay.stopServer());
+
+    test('keeps the manifest off the public relays', () async {
+      await publishPrivateRelayList();
+      final package = await schedulePackageOfTwo('private manifest');
+
+      await _waitFor(() async {
+        final stored = await relayQueryOn(
+          privateRelay,
+          Filter(kinds: [31234], authors: [clientKey.publicKey]),
+        );
+        return stored.any((event) => event.id == package.manifestEventId);
+      });
+
+      expect(
+        await relayQuery(
+          Filter(kinds: [31234], authors: [clientKey.publicKey]),
+        ),
+        isEmpty,
+      );
+      // The requests themselves stay public: the DVMs must read them.
+      await waitForRequestsOnRelay(2);
+    });
+
+    test('recovers a manifest from the private relay', () async {
+      await publishPrivateRelayList();
+      final package = await schedulePackageOfTwo('recovered manifest');
+      await waitForRequestsOnRelay(2);
+      await _waitFor(() async {
+        final stored = await relayQueryOn(
+          privateRelay,
+          Filter(kinds: [31234], authors: [clientKey.publicKey]),
+        );
+        return stored.any((event) => event.id == package.manifestEventId);
+      });
+
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+      expect(
+        await scheduler.listPackages(pubkey: clientKey.publicKey),
+        isEmpty,
+      );
+
+      await scheduler.resync(pubkey: clientKey.publicKey);
+
+      await _waitFor(() async {
+        final packages = await scheduler.listPackages(
+          pubkey: clientKey.publicKey,
+        );
+        return packages.any((p) => p.packageId == package.packageId);
+      });
+    });
+
+    test('cancels the manifest privately and the requests publicly', () async {
+      await publishPrivateRelayList();
+      final package = await schedulePackageOfTwo('split cancel');
+      await waitForRequestsOnRelay(2);
+
+      await scheduler.cancelPackage(
+        package.packageId,
+        pubkey: clientKey.publicKey,
+      );
+
+      await _waitFor(() async {
+        final deletions = await relayQueryOn(
+          privateRelay,
+          Filter(kinds: [5], authors: [clientKey.publicKey]),
+        );
+        return deletions.any(
+          (event) => event.getTags('e').contains(package.manifestEventId),
+        );
+      });
+
+      final publicDeletions = await relayQuery(
+        Filter(kinds: [5], authors: [clientKey.publicKey]),
+      );
+      expect(
+        publicDeletions.single.getTags('e'),
+        containsAll(package.requestEventIds),
+      );
+      expect(
+        publicDeletions.single.getTags('e'),
+        isNot(contains(package.manifestEventId)),
+      );
+    });
+
+    test('never asks a relay for the kind:10013', () async {
+      // An account that publishes no kind:10013 caches nothing either, so a
+      // lookup that went to the relays would go there again on every
+      // declaration, for the majority of accounts.
+      //
+      // Nothing is broadcast here on purpose: the write side resolves the list
+      // itself, through the shim, and that query is a legitimate one.
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await scheduler.resync(pubkey: clientKey.publicKey);
+
+      expect(relay.reqsPerKind[10013], isNull);
+    });
+
+    test('ignores a kind:10013 the cache does not hold', () async {
+      // The other side of that contract, and the reason it is the caller's
+      // job to fetch the list: on the relay is not good enough.
+      await publishPrivateRelayList();
+      await ndk.config.cache.removeEvents(
+        pubKeys: [clientKey.publicKey],
+        kinds: [10013],
+      );
+
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await scheduler.resync(pubkey: clientKey.publicKey);
+
+      expect(privateRelay.reqsPerKind, isEmpty);
+    });
+
+    test('picks up a kind:10013 that reaches the cache mid-session', () async {
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await schedulePackageOfTwo('before the list');
+
+      await publishPrivateRelayList();
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      expect(
+        privateRelay.reqsPerKind,
+        isEmpty,
+        reason: 'nothing should have been asked of the private relay yet',
+      );
+
+      // No restart and no cache invalidation to arrange: the next declaration
+      // re-reads the cache, which now holds the list.
+      await scheduler.resync(pubkey: clientKey.publicKey);
+      final after = await schedulePackageOfTwo('after the list');
+      await Future.delayed(const Duration(milliseconds: 800));
+
+      expect(
+        privateRelay.reqsPerKind.keys,
+        contains(31234),
+        reason: 'the manifest branch should now read the private relay',
+      );
+      final onPrivate = await relayQueryOn(
+        privateRelay,
+        Filter(kinds: [31234], authors: [clientKey.publicKey]),
+      );
+      expect(onPrivate.map((e) => e.id), contains(after.manifestEventId));
+    });
+
+    test('keeps a manifest cancelled after the kind:10013 appeared', () async {
+      // Written without NIP-37, so the manifest is public; its deletion, signed
+      // once the kind:10013 exists, only ever reaches the private relays.
+      final package = await schedulePackageOfTwo('legacy manifest');
+      await waitForRequestsOnRelay(2);
+      await _waitFor(() async {
+        final stored = await relayQuery(
+          Filter(kinds: [31234], authors: [clientKey.publicKey]),
+        );
+        return stored.any((event) => event.id == package.manifestEventId);
+      });
+
+      await publishPrivateRelayList();
+      await scheduler.cancelPackage(
+        package.packageId,
+        pubkey: clientKey.publicKey,
+      );
+      await _waitFor(() async {
+        final deletions = await relayQueryOn(
+          privateRelay,
+          Filter(kinds: [5], authors: [clientKey.publicKey]),
+        );
+        return deletions.any(
+          (event) => event.getTags('e').contains(package.manifestEventId),
+        );
+      });
+
+      // The public manifest survives, which is the accepted leak.
+      expect(
+        (await relayQuery(
+          Filter(kinds: [31234], authors: [clientKey.publicKey]),
+        )).map((e) => e.id),
+        contains(package.manifestEventId),
+      );
+
+      // What must not happen: a device that never saw the cancellation reads
+      // the manifest back from the NIP-65 branch and resurrects the package.
+      // Dropping the kind:5 too is what makes this a fresh device rather than
+      // a local reset, where NDK's cache would hide the manifest on its own.
+      await scheduler.clearLocalAccountData(pubkey: clientKey.publicKey);
+      await ndk.config.cache.removeEvents(
+        pubKeys: [clientKey.publicKey],
+        kinds: [5],
+      );
+
+      await scheduler.resync(pubkey: clientKey.publicKey);
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      expect(
+        await scheduler.listPackages(pubkey: clientKey.publicKey),
+        isEmpty,
+      );
     });
   });
 
@@ -1233,12 +1521,6 @@ void main() {
       pubkey: key.publicKey,
     );
   }
-
-  // The shim resolves relay sets in the background, so a clear racing the
-  // first attempt would see the request written back to the NDK cache.
-  Future<void> waitForRequestsOnRelay(int count) => _waitFor(
-    () async => (await relayQuery(Filter(kinds: [5905]))).length >= count,
-  );
 
   group('multi-account', () {
     setUp(() {

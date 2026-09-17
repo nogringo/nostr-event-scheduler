@@ -13,9 +13,19 @@
   it a `relayListFn`. The scheduler no longer resolves relay URLs itself: it
   describes where each event goes as a `RelaySet` and lets the shim's worker
   resolve it, offline included. The `kind:5905` requests target
-  `union(nip65(account), fallback(inbox(dvm), dvmReadRelays))`, the
-  `kind:31234` manifest `nip65(account)`, and the `kind:5` deletions
-  `union(nip65(account), inbox(dvms))`.
+  `union(nip65(account), fallback(inbox(dvm), dvmReadRelays))` and the
+  `kind:5` deletions `union(nip65(account), inbox(dvms))`.
+- Package manifests go to the account's NIP-37 private relays. A `kind:31234`
+  and the `kind:5` retracting it target
+  `fallback(private(account), nip65(account))`, one set and never both, so a
+  public relay never learns that a package exists or how large it is.
+  `cancelPackage` therefore signs two deletions instead of one, the requests
+  keeping their own so the DVMs still see them. Manifests are read from the
+  private relays and the NIP-65 ones alike.
+- The account's `kind:10013` is read from the NDK cache only, never from a
+  relay. Fetch it like its NIP-65, at login: without it, manifests are read
+  from the NIP-65 relays only, which stays correct but misses another device's
+  private ones.
 - `schedule` and `schedulePackage` no longer throw when the account's NIP-65
   or a DVM's relay list cannot be read right now; the requests are queued and
   delivered once the lists resolve. `dvmReadRelays` keeps its meaning, a

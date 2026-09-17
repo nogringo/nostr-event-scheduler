@@ -180,6 +180,7 @@ The main entry point.
 EventScheduler({
   required Ndk ndk,
   required OfflineBroadcast broadcast,
+  required SyncEngine syncEngine,
   required Database db,
 });
 ```
@@ -187,7 +188,9 @@ EventScheduler({
 The caller is responsible for:
 - Providing a configured `Ndk` instance with a **persistent** `CacheManager` and the accounts to be scheduled for loaded in `ndk.accounts`.
 - Providing a started `OfflineBroadcast` instance (the shim handles its own persistence and retry logic).
+- Providing a started `SyncEngine`, which stays caller-owned and may be shared with the rest of the app.
 - Providing an open Sembast `Database`.
+- Keeping the account's `kind:10013` in the NDK cache if it has one, since that is the only place the scheduler looks for it.
 
 Every method takes an explicit account `pubkey`. The signer is resolved with `ndk.accounts.accounts[pubkey]`, so no account switching is ever needed and the logged account is irrelevant.
 
@@ -199,7 +202,7 @@ Future<void> stopListening({String? pubkey});
 Future<void> resync({required String pubkey});
 ```
 
-- `startListening()`: Starts real-time NDK subscriptions for one account: multi-device sync (`kind:5905`, `kind:31234`, `kind:5`) and DVM feedbacks (`kind:7000`). Triggers an initial `resync()`. Each listened account costs its own subscriptions, so only start the ones actually in use.
+- `startListening()`: Starts real-time NDK subscriptions for one account: multi-device sync (`kind:5905`, `kind:31234`, `kind:5`), the same manifests on the account's private relays, and DVM feedbacks (`kind:7000`). Triggers an initial `resync()`. Each listened account costs its own subscriptions, so only start the ones actually in use.
 - `stopListening()`: Closes the subscriptions of one account, or of every account when `pubkey` is omitted. The scheduler remains fully usable offline.
 - `resync()`: Pull to refresh for one account. The sync engine goes to the relays however fresh its coverage is, then the cache is replayed into the projections.
 
@@ -253,6 +256,19 @@ Future<void> cancel(String jobId, {required String pubkey});
 4. Records one tombstone per request and removes the job.
 
 ```dart
+Future<ScheduledPackage> schedulePackage(
+  List<SchedulePackageItem> items, {
+  required String content,
+  required String pubkey,
+});
+Future<void> cancelPackage(String packageId, {required String pubkey});
+```
+
+A package adds a `kind:31234` manifest over the jobs of its items. The manifest goes to the account's NIP-37 private relays, or to its NIP-65 relays when it publishes no `kind:10013`: one set and never both, since the manifest's `e` tags would tell a public relay that a package exists and how large it is.
+
+`cancelPackage` therefore signs **two** deletions rather than one. The first tags every `kind:5905` of the package and goes to the account's relays plus every DVM's read relays, where the DVMs must see it to cancel. The second tags only the manifest and follows the manifest's own relays.
+
+```dart
 Future<List<ScheduledJob>> listJobs({required String pubkey});
 Stream<List<ScheduledJob>> jobsStream({required String pubkey});
 ```
@@ -279,14 +295,21 @@ Private Sembast wrapper around the six stores. Handles JSON serialization, the r
 
 ### Multi-device Sync
 
-History and real time come from two different mechanisms. `sync_engine_shim_for_ndk` walks the history: the scheduler declares two requests per account and the engine paginates, tracks its coverage per relay and per `authPubkey`, and fills the NDK cache. The NDK subscriptions carry what is happening now, which the engine does not do (it polls, it does not subscribe).
+History and real time come from two different mechanisms. `sync_engine_shim_for_ndk` walks the history: the scheduler declares up to three requests per account and the engine paginates, tracks its coverage per relay and per `authPubkey`, and fills the NDK cache. The NDK subscriptions carry what is happening now, which the engine does not do (it polls, it does not subscribe).
 
-The two declared requests are:
+The declared requests are:
 
 1. `{authors: [pubkey], kinds: [5905, 31234, 5]}`, on the account's NIP-65 write relays.
-2. `{kinds: [7000], #r: [job ids]}`, on the NIP-65 write relays of the DVMs of the account's jobs, a feedback carrying no `p` tag to route on. The job ids identify the request, so a new job means releasing that handle and declaring the new one.
+2. `{authors: [pubkey], kinds: [31234, 5]}`, on the account's NIP-37 private relays (`kind:10013`), declared only when it publishes some. Manifests are written there and nowhere else, so this is the only branch that finds them; request 1 still reads `kind:31234` on the NIP-65 relays, for the manifests written before the account had a `kind:10013`, or by a client without NIP-37.
+3. `{kinds: [7000], #r: [job ids]}`, on the NIP-65 write relays of the DVMs of the account's jobs, a feedback carrying no `p` tag to route on. The job ids identify the request, so a new job means releasing that handle and declaring the new one.
 
-Both name the account in `authPubkey`, so they authenticate under it (NIP-42) and their coverage is filed under it. The NDK subscriptions carry the same identity through `RelayAuth.require`. Relay lists that resolve to nothing fall back to `ndk.config.bootstrapRelays`.
+All three name the account in `authPubkey`, so they authenticate under it (NIP-42) and their coverage is filed under it, which a private relay requires. The NDK subscriptions carry the same identity through `RelayAuth.require`, and the private relays get one of their own for `{kinds: [31234, 5]}`. Relay lists that resolve to nothing fall back to `ndk.config.bootstrapRelays`, except the private list: no `kind:10013` simply means no private branch.
+
+The `kind:10013` is read from the **NDK cache only**, never from a relay, and re-read on every declaration. It is decrypted with the signer of the account it belongs to, through `ndk.decryptedEventPayloads`, so a given list is decrypted once and a remote signer is not asked again.
+
+Going to the relays instead would mean a query on every declaration for the accounts that publish no `kind:10013`, since a missing event leaves nothing to cache. Reading the cache costs nothing, so a list is picked up the moment it lands there, whoever fetched it, with no invalidation to arrange.
+
+Hence the caller's part: fetch the account's `kind:10013` like its NIP-65, at login. Without it, manifests are read from the NIP-65 relays only, which stays correct but blind to another device's private manifests. The write side needs nothing, `OfflineBroadcast` resolves the list itself and its query leaves it in the NDK cache for the read side to find.
 
 The engine returns handles and statuses, never events, so anything it lands in the cache reaches the projections only by replaying that cache: on every page that carried events, and on every `resync()`. Replaying is safe to repeat, and a feedback whose payload is already decrypted is re-applied without emitting a `StatusUpdate` a second time.
 

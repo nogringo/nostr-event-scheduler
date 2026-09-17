@@ -27,6 +27,10 @@ class MockRelay {
       {}; // NIP-85 assertions keyed by "author:dTag"
   final Set<Nip01Event> _storedEvents = {}; // Store received events
 
+  /// How many REQs asked for each kind, so a test can tell an unasked-for
+  /// query from a subscription that was never opened.
+  final Map<int, int> reqsPerKind = {};
+
   // Track all connected clients with their subscriptions
   final Map<WebSocket, Map<String, List<Filter>>> _clientSubscriptions = {};
   bool signEvents;
@@ -304,6 +308,9 @@ class MockRelay {
                 return;
               }
 
+              for (final kind in filters.expand((f) => f.kinds ?? const [])) {
+                reqsPerKind.update(kind, (n) => n + 1, ifAbsent: () => 1);
+              }
               if (filters.isNotEmpty) {
                 // Store the subscription for this client
                 _clientSubscriptions[webSocket]?[requestId] = filters;
