@@ -1,3 +1,8 @@
+## 0.5.2
+
+- The `kind:5` deletions of `kind:5905` requests tag each targeted DVM with a
+  `p` tag, as the Scheduler DVM spec now requires.
+
 ## 0.5.1
 
 - Fix a DVM's job status regressing when relays return older `kind:7000`

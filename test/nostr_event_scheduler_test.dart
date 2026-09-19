@@ -447,6 +447,10 @@ void main() {
       );
       expect(deletions, hasLength(1));
       expect(deletions.single.getTags('e'), containsAll(job.requestEventIds));
+      expect(
+        deletions.single.getTags('p'),
+        unorderedEquals([dvmKey.publicKey, dvm2Key.publicKey]),
+      );
       expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
     });
 
@@ -964,6 +968,8 @@ void main() {
 
       final deletion = deletions.first;
       expect(deletion.getTags('e'), containsAll(job.requestEventIds));
+      expect(deletion.getTags('k'), ['5905']);
+      expect(deletion.getTags('p'), [dvmKey.publicKey]);
     });
 
     test('cancelPackage deletes linked jobs and manifest', () async {
@@ -1017,6 +1023,7 @@ void main() {
       );
       expect(manifestDeletion.getTags('e'), [package.manifestEventId]);
       expect(manifestDeletion.getTags('k'), ['31234']);
+      expect(manifestDeletion.getTags('p'), isEmpty);
 
       final requestDeletion = deletions.singleWhere(
         (event) => event.getTags('e').contains(package.requestEventIds.first),
@@ -1030,6 +1037,7 @@ void main() {
         isNot(contains(package.manifestEventId)),
       );
       expect(requestDeletion.getTags('k'), ['5905']);
+      expect(requestDeletion.getTags('p'), [dvmKey.publicKey]);
       expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
       expect(
         await scheduler.listPackages(pubkey: clientKey.publicKey),
@@ -1114,6 +1122,7 @@ void main() {
           containsAll(package.requestEventIds),
         );
         expect(requestDeletion.getTags('k'), ['5905']);
+        expect(requestDeletion.getTags('p'), [dvmKey.publicKey]);
         expect(
           await scheduler.listPackages(pubkey: clientKey.publicKey),
           isEmpty,

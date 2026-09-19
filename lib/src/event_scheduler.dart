@@ -463,6 +463,7 @@ class EventScheduler {
       eventIds: job.requestEventIds,
       kinds: const [kindScheduleRequest],
       content: 'cancel',
+      dvmPubkeys: job.dvmPubkeys,
     );
 
     await _broadcast.broadcast(
@@ -494,18 +495,20 @@ class EventScheduler {
     // on their inbox relays, where a deletion tagging them all would reveal the
     // package and its size.
     if (package.requestEventIds.isNotEmpty) {
+      final dvmPubkeys = await _dvmPubkeysForRequestEventIds(
+        pubkey,
+        package.requestEventIds,
+      );
       final requestDeletion = await _signDeletion(
         pubkey: pubkey,
         eventIds: package.requestEventIds,
         kinds: const [kindScheduleRequest],
         content: 'cancel package',
+        dvmPubkeys: dvmPubkeys,
       );
       await _broadcast.broadcast(
         requestDeletion,
-        relaySet: await _packageDeletionRelaySet(
-          pubkey,
-          package.requestEventIds,
-        ),
+        relaySet: _deletionRelaySet(pubkey, dvmPubkeys),
         pubkey: pubkey,
       );
 
@@ -1436,6 +1439,7 @@ class EventScheduler {
     required Iterable<String> eventIds,
     required List<int> kinds,
     required String content,
+    Iterable<String> dvmPubkeys = const [],
   }) async {
     final signer = _requireSigner(pubkey);
     final deletion = Nip01Event(
@@ -1444,6 +1448,8 @@ class EventScheduler {
       tags: [
         for (final eventId in eventIds) ['e', eventId],
         for (final kind in kinds) ['k', '$kind'],
+        for (final dvmPubkey in {...dvmPubkeys})
+          if (dvmPubkey.isNotEmpty) ['p', dvmPubkey],
       ],
       content: content,
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
@@ -1532,7 +1538,7 @@ class EventScheduler {
     return events.first.getFirstTag('p');
   }
 
-  Future<RelaySet> _packageDeletionRelaySet(
+  Future<Set<String>> _dvmPubkeysForRequestEventIds(
     String pubkey,
     Iterable<String> requestEventIds,
   ) async {
@@ -1545,7 +1551,7 @@ class EventScheduler {
       if (dvmPubkey == null || dvmPubkey.isEmpty) continue;
       dvmPubkeys.add(dvmPubkey);
     }
-    return _deletionRelaySet(pubkey, dvmPubkeys);
+    return dvmPubkeys;
   }
 
   String? _jobIdOf(String payload) {
