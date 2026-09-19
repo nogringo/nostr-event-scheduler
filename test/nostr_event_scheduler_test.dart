@@ -92,6 +92,7 @@ void main() {
     required String jobId,
     required String status,
     String? message,
+    int? createdAt,
   }) async {
     final ephemeralKey = Bip340.generatePrivateKey();
     final payload = jsonEncode({'status': status, 'message': ?message});
@@ -108,7 +109,7 @@ void main() {
         ['ephemeral-pubkey', ephemeralKey.publicKey],
       ],
       content: encrypted,
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      createdAt: createdAt ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
     final signedFeedback = Nip01Utils.signWithPrivateKey(
       event: feedbackEvent,
@@ -1472,6 +1473,52 @@ void main() {
       final updatedJob = jobs.firstWhere((j) => j.jobId == job.jobId);
       expect(updatedJob.status, JobStatus.scheduled);
     });
+
+    test(
+      'an older feedback received later does not roll the status back',
+      () async {
+        final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+          Nip01Event(
+            pubKey: clientKey.publicKey,
+            kind: 1,
+            tags: [],
+            content: 'out of order',
+            createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          ),
+        );
+        final job = await scheduler.schedule(
+          signedEvent,
+          [dvmKey.publicKey],
+          relays: [relay.url],
+          pubkey: clientKey.publicKey,
+        );
+        await scheduler.startListening(pubkey: clientKey.publicKey);
+        await Future.delayed(const Duration(milliseconds: 500));
+
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        await publishFeedback(
+          dvm: dvmKey,
+          jobId: job.jobId,
+          status: 'published',
+          createdAt: now,
+        );
+        await _waitFor(() async {
+          final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
+          return jobs.single.status == JobStatus.published;
+        });
+
+        await publishFeedback(
+          dvm: dvmKey,
+          jobId: job.jobId,
+          status: 'scheduled',
+          createdAt: now - 60,
+        );
+        await Future.delayed(const Duration(milliseconds: 500));
+
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
+        expect(jobs.single.status, JobStatus.published);
+      },
+    );
   });
 
   group('decryptPending', () {
@@ -1684,6 +1731,47 @@ void main() {
       expect(
         JobStatus.aggregate([JobStatus.cancelled, JobStatus.error]),
         JobStatus.error,
+      );
+    });
+  });
+
+  group('ScheduledJobRequest.isSupersededBy', () {
+    ScheduledJobRequest applied(JobStatus status, int? at) =>
+        ScheduledJobRequest(
+          dvmPubkey: 'dvm',
+          requestEventId: 'request',
+          status: status,
+          feedbackAt: at,
+          updatedAt: 0,
+        );
+
+    test('any feedback replaces no feedback', () {
+      expect(
+        applied(JobStatus.pending, null).isSupersededBy(1, JobStatus.scheduled),
+        isTrue,
+      );
+    });
+
+    test('only a newer feedback replaces the applied one', () {
+      final request = applied(JobStatus.published, 100);
+      expect(request.isSupersededBy(99, JobStatus.scheduled), isFalse);
+      expect(request.isSupersededBy(101, JobStatus.failed), isTrue);
+    });
+
+    test('in the same second, only scheduled gives way', () {
+      expect(
+        applied(
+          JobStatus.scheduled,
+          100,
+        ).isSupersededBy(100, JobStatus.published),
+        isTrue,
+      );
+      expect(
+        applied(
+          JobStatus.published,
+          100,
+        ).isSupersededBy(100, JobStatus.scheduled),
+        isFalse,
       );
     });
   });

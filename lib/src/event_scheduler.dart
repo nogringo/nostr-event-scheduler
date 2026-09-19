@@ -1261,9 +1261,11 @@ class EventScheduler {
       // feedback to one of the job's requests.
       final request = job.requestForDvm(event.pubKey);
       if (request == null) return;
+      if (!request.isSupersededBy(event.createdAt, status)) return;
 
       request.status = status;
       request.lastMessage = message;
+      request.feedbackAt = event.createdAt;
       request.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       job.updatedAt = request.updatedAt;
       await _store.putJob(job);

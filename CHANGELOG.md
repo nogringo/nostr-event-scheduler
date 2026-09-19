@@ -1,3 +1,8 @@
+## 0.5.1
+
+- Fix a DVM's job status regressing when relays return older `kind:7000`
+  feedback after a newer one. The status now follows the latest feedback.
+
 ## 0.5.0
 
 - **Breaking**: `EventScheduler` takes a caller-owned `syncEngine`. History

@@ -19,6 +19,9 @@ class ScheduledJobRequest {
   /// Optional human-readable message from this DVM.
   String? lastMessage;
 
+  /// `created_at` of the kind:7000 that set [status], null until one arrives.
+  int? feedbackAt;
+
   /// Unix timestamp of the last update for this request.
   int updatedAt;
 
@@ -27,8 +30,20 @@ class ScheduledJobRequest {
     required this.requestEventId,
     this.status = JobStatus.pending,
     this.lastMessage,
+    this.feedbackAt,
     required this.updatedAt,
   });
+
+  /// Whether a feedback created at [createdAt] with [status] replaces the one
+  /// already applied. Relays return stored events newest first, so arrival
+  /// order says nothing about which feedback is the latest.
+  bool isSupersededBy(int createdAt, JobStatus status) {
+    final appliedAt = feedbackAt;
+    if (appliedAt == null || createdAt > appliedAt) return true;
+    if (createdAt < appliedAt) return false;
+    // Same second: only `scheduled` can be followed by another status.
+    return this.status == JobStatus.scheduled;
+  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -36,6 +51,7 @@ class ScheduledJobRequest {
       'requestEventId': requestEventId,
       'status': status.name,
       'lastMessage': lastMessage,
+      'feedbackAt': feedbackAt,
       'updatedAt': updatedAt,
     };
   }
@@ -46,6 +62,7 @@ class ScheduledJobRequest {
       requestEventId: json['requestEventId'] as String,
       status: JobStatus.values.byName(json['status'] as String),
       lastMessage: json['lastMessage'] as String?,
+      feedbackAt: json['feedbackAt'] as int?,
       updatedAt: json['updatedAt'] as int,
     );
   }

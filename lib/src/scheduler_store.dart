@@ -41,7 +41,7 @@ class SchedulerStore {
 
   static const String _kComputedSchemaKey = 'computed_schema';
   static const String _kBuiltPrefix = 'built/';
-  static const int _currentSchemaVersion = 4;
+  static const int _currentSchemaVersion = 5;
 
   final StoreRef<String, String> _decryptedPayloads;
   final StoreRef<String, String> _pendingDecryption;
