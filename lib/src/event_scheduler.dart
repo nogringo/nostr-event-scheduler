@@ -1156,10 +1156,12 @@ class EventScheduler {
     return decrypted;
   }
 
-  /// The pubkey [event] was NIP-44 encrypted against.
+  /// The pubkey [event] was NIP-44 encrypted against. A feedback from a DVM
+  /// written against the earlier spec names a throwaway key in
+  /// `ephemeral-pubkey`; without that tag the DVM signed and encrypted it.
   String? _counterpartyOf(Nip01Event event) => switch (event.kind) {
     kindScheduleRequest => event.getFirstTag('p'),
-    kindFeedback => event.getFirstTag('ephemeral-pubkey'),
+    kindFeedback => event.getFirstTag('ephemeral-pubkey') ?? event.pubKey,
     kindPackageManifest => event.pubKey,
     _ => null,
   };

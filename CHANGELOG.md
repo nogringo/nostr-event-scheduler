@@ -1,3 +1,9 @@
+## 0.5.3
+
+- Read `kind:7000` feedback encrypted with the DVM key, as the spec now
+  describes. A DVM still naming a one-time key in `ephemeral-pubkey` keeps
+  being decrypted.
+
 ## 0.5.2
 
 - The `kind:5` deletions of `kind:5905` requests tag each targeted DVM with a

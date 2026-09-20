@@ -316,7 +316,7 @@ The engine returns handles and statuses, never events, so anything it lands in t
 For each event, whether replayed from the cache or received live:
 - `kind:5905`: Try to decrypt immediately. If the signer is available, store in `decrypted_payloads` and update/create the job in `jobs`. Requests sharing a `job_id` merge into one job, one `ScheduledJobRequest` per `kind:5905`. If the signer is unavailable, queue in `pending_decryption`.
 - `kind:5`: Store in `tombstones`. Remove the tombstoned request from its job; remove the job once its last request is gone.
-- `kind:7000`: Try to decrypt with the ephemeral public key. The feedback is attributed to one of the job's requests by the event's signature pubkey (the DVM signs feedbacks with its main key). A feedback signed by a pubkey that is not one of the job's DVMs is ignored. Update that request's status and emit a `StatusUpdate`.
+- `kind:7000`: Try to decrypt with the `ephemeral-pubkey` tag when a DVM written against the earlier spec set one, otherwise with the DVM pubkey. The feedback is attributed to one of the job's requests by the event's signature pubkey (the DVM signs feedbacks with its main key). A feedback signed by a pubkey that is not one of the job's DVMs is ignored. Update that request's status and emit a `StatusUpdate`.
 
 When a request is learned after its feedback (out-of-order sync), feedbacks already sitting in the NDK cache are re-applied to the job, oldest first, so every request converges to its latest known status.
 
@@ -392,7 +392,7 @@ kind:7000 received from subscription
 Extract r tag (jobId) -> look up the job -> owner pubkey
   |
   v
-Decrypt content with that account's signer (ephemeral-pubkey as counterparty)
+Decrypt content with that account's signer (ephemeral-pubkey, else the DVM pubkey)
   |
   v
 Store in decrypted_payloads

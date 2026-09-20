@@ -93,12 +93,13 @@ void main() {
     required String status,
     String? message,
     int? createdAt,
+    bool legacyEphemeralKey = false,
   }) async {
-    final ephemeralKey = Bip340.generatePrivateKey();
+    final senderKey = legacyEphemeralKey ? Bip340.generatePrivateKey() : dvm;
     final payload = jsonEncode({'status': status, 'message': ?message});
     final encrypted = await Nip44.encryptMessage(
       payload,
-      ephemeralKey.privateKey!,
+      senderKey.privateKey!,
       clientKey.publicKey,
     );
     final feedbackEvent = Nip01Event(
@@ -106,7 +107,7 @@ void main() {
       kind: 7000,
       tags: [
         ['r', jobId],
-        ['ephemeral-pubkey', ephemeralKey.publicKey],
+        if (legacyEphemeralKey) ['ephemeral-pubkey', senderKey.publicKey],
       ],
       content: encrypted,
       createdAt: createdAt ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
@@ -416,6 +417,41 @@ void main() {
         updates.map((update) => update.dvmPubkey),
         containsAll([dvmKey.publicKey, dvm2Key.publicKey]),
       );
+    });
+
+    test('reads feedback from a DVM still using an ephemeral key', () async {
+      final event = Nip01Event(
+        pubKey: clientKey.publicKey,
+        kind: 1,
+        tags: [],
+        content: 'legacy feedback',
+        createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        event,
+      );
+
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey],
+        relays: [relay.url],
+        pubkey: clientKey.publicKey,
+      );
+
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      await publishFeedback(
+        dvm: dvmKey,
+        jobId: job.jobId,
+        status: 'scheduled',
+        legacyEphemeralKey: true,
+      );
+
+      await _waitFor(() async {
+        final jobs = await scheduler.listJobs(pubkey: clientKey.publicKey);
+        return jobs.single.status == JobStatus.scheduled;
+      });
     });
 
     test('cancel tags every kind:5905 request in one kind:5', () async {
@@ -757,17 +793,22 @@ void main() {
       final dvmDb = await databaseFactoryMemory.openDatabase(
         'dvm_integration_${DateTime.now().microsecondsSinceEpoch}.db',
       );
+      final dvmSyncEngine = SyncEngine(dvmNdk, db: dvmDb);
+      dvmSyncEngine.start();
       final dvm = SchedulerDvm(
         SchedulerDvmConfig(
           ndk: dvmNdk,
-          database: dvmDb,
+          store: SembastDvmJobStore(dvmDb),
+          syncEngine: dvmSyncEngine,
           bootstrapRelays: [relay.url],
           announceNip89: false,
+          targetRelayPolicy: RelayUrlPolicy.permissive,
         ),
       );
 
       addTearDown(() async {
         await dvm.dispose();
+        await dvmSyncEngine.dispose();
         await dvmDb.close();
         await dvmNdk.destroy();
       });
@@ -816,7 +857,10 @@ void main() {
 
       await _waitFor(() async {
         for (final job in package.jobs) {
-          final stored = await dvm.config.store.getJob(job.jobId);
+          final stored = await dvm.config.store.getJobByClientJobId(
+            clientPubkey: clientKey.publicKey,
+            jobId: job.jobId,
+          );
           if (stored?.status != DvmJobStatus.scheduled) return false;
         }
         return true;
@@ -863,17 +907,22 @@ void main() {
         final dvmDb = await databaseFactoryMemory.openDatabase(
           'dvm_redundant_${key.publicKey}_${DateTime.now().microsecondsSinceEpoch}.db',
         );
+        final dvmSyncEngine = SyncEngine(dvmNdk, db: dvmDb);
+        dvmSyncEngine.start();
         final dvm = SchedulerDvm(
           SchedulerDvmConfig(
             ndk: dvmNdk,
-            database: dvmDb,
+            store: SembastDvmJobStore(dvmDb),
+            syncEngine: dvmSyncEngine,
             bootstrapRelays: [relay.url],
             announceNip89: false,
+            targetRelayPolicy: RelayUrlPolicy.permissive,
           ),
         );
 
         addTearDown(() async {
           await dvm.dispose();
+          await dvmSyncEngine.dispose();
           await dvmDb.close();
           await dvmNdk.destroy();
         });
@@ -906,7 +955,10 @@ void main() {
       );
 
       await _waitFor(() async {
-        final stored = await dvmA.config.store.getJob(job.jobId);
+        final stored = await dvmA.config.store.getJobByClientJobId(
+          clientPubkey: clientKey.publicKey,
+          jobId: job.jobId,
+        );
         return stored?.status == DvmJobStatus.scheduled;
       });
 
@@ -914,7 +966,10 @@ void main() {
       // resync, accepting the same job_id independently
       final dvmB = await startDvm(dvm2Key);
       await _waitFor(() async {
-        final stored = await dvmB.config.store.getJob(job.jobId);
+        final stored = await dvmB.config.store.getJobByClientJobId(
+          clientPubkey: clientKey.publicKey,
+          jobId: job.jobId,
+        );
         return stored?.status == DvmJobStatus.scheduled;
       });
 

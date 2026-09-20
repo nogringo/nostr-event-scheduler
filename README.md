@@ -2,7 +2,7 @@
 
 Local-first Dart package for scheduling Nostr events via Scheduler DVMs.
 
-This package implements the Scheduler DVM protocol and provides a robust, offline-first API for creating, tracking, and cancelling scheduled Nostr events.
+This package implements the [Scheduler DVM protocol](https://openspecs.uid.ovh/spec/npub1kg4sdvz3l4fr99n2jdz2vdxe2mpacva87hkdetv76ywacsfq5leqquw5te/scheduler-dvm) and provides a robust, offline-first API for creating, tracking, and cancelling scheduled Nostr events.
 
 ## Features
 
