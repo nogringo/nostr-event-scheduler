@@ -982,9 +982,9 @@ class EventScheduler {
     return true;
   }
 
-  RelayAuth? _authOf(String pubkey) {
+  AuthPolicy? _authOf(String pubkey) {
     final account = _ndk.accounts.accounts[pubkey];
-    return account == null ? null : RelayAuth.require(account);
+    return account == null ? null : AuthPolicy.require(account);
   }
 
   void _emitSyncError(String pubkey, Object error) {

@@ -1,3 +1,7 @@
+## 0.5.4
+
+- Require `ndk: ^0.10.0-dev.6` and `sync_engine_shim_for_ndk: ^0.7.1`.
+
 ## 0.5.3
 
 - Read `kind:7000` feedback encrypted with the DVM key, as the spec now
