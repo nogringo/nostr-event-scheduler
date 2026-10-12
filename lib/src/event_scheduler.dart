@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/ndk.dart' hide RelaySet;
+import 'package:ndk/ndk.dart';
 import 'package:sembast/sembast.dart' as sembast;
 import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
@@ -313,7 +313,7 @@ class EventScheduler {
   ///
   /// The kind:5905 requests are broadcast via the [OfflineBroadcast] shim to
   /// all the account's NIP-65 relays (read + write) plus each DVM's read
-  /// relays. Both are described as a [RelaySet] and resolved by the shim's
+  /// relays. Both are described as a [UrlSet] and resolved by the shim's
   /// worker, so a DVM whose relay list cannot be read right now delays
   /// delivery instead of failing the call. [dvmReadRelays] is used only for a
   /// DVM whose NIP-65 resolves to no read relay.
@@ -1486,16 +1486,16 @@ class EventScheduler {
 
   /// Where a kind:5905 request goes: the account's own relays plus the read
   /// relays the DVM publishes, with [dvmReadRelays] as a last resort.
-  RelaySet _requestRelaySet(
+  UrlSet _requestRelaySet(
     String pubkey,
     String dvmPubkey,
     List<String>? dvmReadRelays,
   ) {
-    return RelaySet.union([
-      RelaySet.nip65(pubkey),
-      RelaySet.fallback([
-        RelaySet.inbox([dvmPubkey]),
-        RelaySet.explicit(dvmReadRelays ?? const []),
+    return UrlSet.union([
+      UrlSet.nip65(pubkey),
+      UrlSet.fallback([
+        UrlSet.inbox(dvmPubkey),
+        UrlSet.explicit(dvmReadRelays ?? const []),
       ]),
     ]);
   }
@@ -1503,20 +1503,15 @@ class EventScheduler {
   /// Where a kind:31234 manifest and the kind:5 retracting it go: the NIP-37
   /// private relays of [pubkey], or its NIP-65 when it publishes none. One set
   /// and never both, so a public relay never learns a package exists.
-  RelaySet _manifestRelaySet(String pubkey) {
-    return RelaySet.fallback([
-      RelaySet.private(pubkey),
-      RelaySet.nip65(pubkey),
-    ]);
+  UrlSet _manifestRelaySet(String pubkey) {
+    return UrlSet.fallback([UrlSet.private(pubkey), UrlSet.nip65(pubkey)]);
   }
 
-  RelaySet _deletionRelaySet(String pubkey, Iterable<String> dvmPubkeys) {
-    return RelaySet.union([
-      RelaySet.nip65(pubkey),
-      RelaySet.inbox([
-        for (final dvmPubkey in {...dvmPubkeys})
-          if (dvmPubkey.isNotEmpty) dvmPubkey,
-      ]),
+  UrlSet _deletionRelaySet(String pubkey, Iterable<String> dvmPubkeys) {
+    return UrlSet.union([
+      UrlSet.nip65(pubkey),
+      for (final dvmPubkey in {...dvmPubkeys})
+        if (dvmPubkey.isNotEmpty) UrlSet.inbox(dvmPubkey),
     ]);
   }
 
@@ -1692,7 +1687,7 @@ class _CreatedJob {
 class _CreatedJobRequest {
   final String dvmPubkey;
   final Nip01Event event;
-  final RelaySet relaySet;
+  final UrlSet relaySet;
 
   _CreatedJobRequest({
     required this.dvmPubkey,

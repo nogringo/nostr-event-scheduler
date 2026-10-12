@@ -1,3 +1,9 @@
+## 0.6.0
+
+- **Breaking**: require `broadcast_queue_shim_for_ndk: ^0.8.0`. The host
+  building the `OfflineBroadcast` must move to it too, where `RelaySet` is now
+  `UrlSet` and the `hide RelaySet` on the ndk import is no longer needed.
+
 ## 0.5.5
 
 - Widen the dependency constraints so the next minor lines resolve:
