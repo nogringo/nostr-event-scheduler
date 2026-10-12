@@ -1,3 +1,11 @@
+## 0.5.5
+
+- Widen the dependency constraints so the next minor lines resolve:
+  `ndk: '>=0.10.0-dev.6 <0.12.0'`,
+  `broadcast_queue_shim_for_ndk: '>=0.6.0 <0.8.0'` and
+  `sync_engine_shim_for_ndk: '>=0.7.1 <0.9.0'`. For tests,
+  `nostr_scheduler_dvm: '>=0.4.0 <0.6.0'`.
+
 ## 0.5.4
 
 - Require `ndk: ^0.10.0-dev.6` and `sync_engine_shim_for_ndk: ^0.7.1`.
