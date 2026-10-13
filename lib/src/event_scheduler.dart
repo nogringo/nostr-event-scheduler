@@ -58,16 +58,9 @@ class EventScheduler {
   /// and only ever forgets those. Disposing the engine, or clearing everything
   /// it persisted, is the caller's call.
   ///
-  /// Reading an account's NIP-37 private relays is the caller's job in one
-  /// respect: the scheduler only ever looks for its kind:10013 in the NDK
-  /// cache, never on a relay. Fetch it like any other relay list of the
-  /// account, at login or alongside its NIP-65, and manifests are read from
-  /// the private relays as soon as it lands. Without it they are read from the
-  /// NIP-65 relays only, which is correct but blind to another device's
-  /// private manifests.
-  ///
-  /// Writing needs nothing: [OfflineBroadcast] resolves the list itself, and
-  /// leaves it in the NDK cache for the read side to find.
+  /// Relay lists need nothing from the caller either way: [OfflineBroadcast]
+  /// resolves them to write, and the [SyncEngine] to read, following an
+  /// account that moves its NIP-65 or NIP-37 relays.
   EventScheduler({
     required this._ndk,
     required this._broadcast,
@@ -123,7 +116,7 @@ class EventScheduler {
         state.subscriptions.add(response.stream.listen(_onRawEvent));
       }
 
-      final privateRelays = await _privateSyncRelays(pubkey);
+      final privateRelays = await _cachedPrivateRelays(pubkey);
       if (privateRelays.isNotEmpty) {
         final response = _ndk.requests.subscription(
           filter: _manifestFilter(pubkey),
@@ -771,30 +764,22 @@ class EventScheduler {
     );
     declaration.holders++;
 
-    if (declaration.own == null) {
-      final relays = await _ownSyncRelays(pubkey);
-      declaration.own ??= _register(
-        pubkey,
-        SyncRequest(
-          filters: [_ownFilter(pubkey)],
-          relays: relays,
-          authPubkey: pubkey,
-        ),
-      );
-    }
-    if (declaration.manifests == null) {
-      final relays = await _privateSyncRelays(pubkey);
-      if (relays.isNotEmpty) {
-        declaration.manifests = _register(
-          pubkey,
-          SyncRequest(
-            filters: [_manifestFilter(pubkey)],
-            relays: relays,
-            authPubkey: pubkey,
-          ),
-        );
-      }
-    }
+    declaration.own ??= _register(
+      pubkey,
+      SyncRequest(
+        filters: [_ownFilter(pubkey)],
+        relays: _orBootstrap(UrlSet.outbox(pubkey)),
+        authPubkey: pubkey,
+      ),
+    );
+    declaration.manifests ??= _register(
+      pubkey,
+      SyncRequest(
+        filters: [_manifestFilter(pubkey)],
+        relays: UrlSet.private(pubkey),
+        authPubkey: pubkey,
+      ),
+    );
     await _declareFeedbackNow(pubkey);
   }
 
@@ -812,42 +797,45 @@ class EventScheduler {
     await declaration.dispose(_syncEngine);
   }
 
-  /// Declares the feedback request of [pubkey], or redeclares it when the jobs
-  /// it follows changed: the job ids are part of what identifies a request, so
-  /// a new set is a new handle rather than an update of the held one.
+  /// Declares one feedback request per job of [pubkey] still awaiting a final
+  /// status, and releases the others. The job ids are part of what identifies
+  /// a request, so one request per job keeps each coverage as jobs come and go.
   Future<void> _declareFeedbackNow(String pubkey) async {
-    if (_declarations[pubkey] == null) return;
-
-    final jobIds = (await _store.listJobs(pubkey)).map((j) => j.jobId).toList()
-      ..sort();
-    final relays = jobIds.isEmpty
-        ? const <String>[]
-        : await _feedbackSyncRelays(pubkey);
-
+    final jobs = await _jobsAwaitingFeedback(pubkey);
     final declaration = _declarations[pubkey];
     if (declaration == null) return;
 
-    final existing = declaration.feedback;
-    if (existing != null &&
-        _sameStrings(existing.request.filters.first.tags?['#r'], jobIds) &&
-        _sameStrings(existing.request.relays, relays)) {
-      return;
+    final wanted = {for (final job in jobs) _feedbackKey(job): job};
+    for (final key in declaration.feedback.keys.toList()) {
+      if (wanted.containsKey(key)) continue;
+      await declaration.feedback.remove(key)!.dispose(_syncEngine);
     }
-
-    if (existing != null) {
-      declaration.feedback = null;
-      await existing.dispose(_syncEngine);
+    for (final MapEntry(:key, value: job) in wanted.entries) {
+      declaration.feedback[key] ??= _register(
+        pubkey,
+        SyncRequest(
+          filters: [
+            _feedbackFilter([job.jobId]),
+          ],
+          relays: _feedbackRelaySet(job.dvmPubkeys),
+          authPubkey: pubkey,
+        ),
+      );
     }
-    if (jobIds.isEmpty || relays.isEmpty) return;
+  }
 
-    declaration.feedback = _register(
-      pubkey,
-      SyncRequest(
-        filters: [_feedbackFilter(jobIds)],
-        relays: relays,
-        authPubkey: pubkey,
-      ),
-    );
+  /// A job's DVMs pick its relays, so a DVM joining it is a new request.
+  String _feedbackKey(ScheduledJob job) =>
+      '${job.jobId}|${(job.dvmPubkeys..sort()).join(',')}';
+
+  /// [pubkey]'s jobs a DVM may still report on. A final status is the last
+  /// feedback a DVM sends, so a job settled on every DVM is not followed.
+  Future<List<ScheduledJob>> _jobsAwaitingFeedback(String pubkey) async {
+    final jobs = [
+      for (final job in await _store.listJobs(pubkey))
+        if (job.requests.any((r) => !r.status.isFinal)) job,
+    ];
+    return jobs..sort((a, b) => a.jobId.compareTo(b.jobId));
   }
 
   _DeclaredRequest _register(String pubkey, SyncRequest request) {
@@ -869,108 +857,39 @@ class EventScheduler {
     return declared;
   }
 
-  Future<void> _forgetCoverage(String pubkey, List<String> jobIds) async {
+  Future<void> _forgetCoverage(String pubkey, Iterable<String> jobIds) async {
     await _syncEngine.forgetFilter(_ownFilter(pubkey), authPubkey: pubkey);
     await _syncEngine.forgetFilter(_manifestFilter(pubkey), authPubkey: pubkey);
-    if (jobIds.isEmpty) return;
-    await _syncEngine.forgetFilter(
-      _feedbackFilter(jobIds..sort()),
-      authPubkey: pubkey,
-    );
-  }
-
-  /// Where [pubkey]'s own scheduler events were published.
-  Future<List<String>> _ownSyncRelays(String pubkey) async {
-    final relayList = await _ndk.userRelayLists.getSingleUserRelayList(pubkey);
-    return _orBootstrap(relayList?.writeUrls);
-  }
-
-  /// [pubkey]'s NIP-37 private relays, where its manifests go. Empty when the
-  /// NDK cache holds no kind:10013 for it, or when no signer can open the one
-  /// it holds.
-  ///
-  /// The cache is the only source, so this costs nothing and is re-read on
-  /// every declaration: a list that lands in the cache is used at once,
-  /// whoever put it there. Keeping it there is the caller's job, see
-  /// [EventScheduler.new].
-  Future<List<String>> _privateSyncRelays(String pubkey) async {
-    final lists = await _ndk.config.cache.loadEvents(
-      pubKeys: [pubkey],
-      kinds: [kindPrivateRelays],
-    );
-    if (lists.isEmpty) return const [];
-
-    final list = lists.reduce((a, b) => b.createdAt > a.createdAt ? b : a);
-    if (list.content.isEmpty) return const [];
-
-    final payloads = _ndk.decryptedEventPayloads;
-    var plaintext = await payloads.loadCachedPlaintext(
-      eventId: list.id,
-      viewerPubKey: pubkey,
-    );
-    if (plaintext == null) {
-      final signer = _signerOrNull(pubkey);
-      if (signer == null) return const [];
-      try {
-        plaintext = await payloads.loadOrDecrypt(
-          event: list,
-          viewerPubKey: pubkey,
-          scheme: DecryptedPayloadScheme.nip44,
-          decrypt: () => signer.decryptNip44(
-            ciphertext: list.content,
-            senderPubKey: list.pubKey,
-          ),
-        );
-      } catch (_) {
-        return const [];
-      }
-    }
-    return plaintext == null ? const [] : _relaysOfPrivateTags(plaintext);
-  }
-
-  /// Relay URLs of the decrypted tags of a kind:10013. Anything that is not a
-  /// JSON list of tags yields no relay.
-  List<String> _relaysOfPrivateTags(String plaintext) {
-    final Object? tags;
-    try {
-      tags = jsonDecode(plaintext);
-    } on FormatException {
-      return const [];
-    }
-    if (tags is! List) return const [];
-    return [
-      for (final tag in tags)
-        if (tag is List &&
-            tag.length >= 2 &&
-            tag[0] == 'relay' &&
-            tag[1] is String)
-          tag[1] as String,
-    ]..sort();
-  }
-
-  /// Where the DVMs of [pubkey]'s jobs publish their kind:7000: their own
-  /// NIP-65 write relays, a feedback carrying no `p` tag to route on.
-  Future<List<String>> _feedbackSyncRelays(String pubkey) async {
-    final dvmPubkeys = {
-      for (final job in await _store.listJobs(pubkey))
-        for (final request in job.requests)
-          if (request.dvmPubkey.isNotEmpty) request.dvmPubkey,
-    };
-
-    final relays = <String>{};
-    for (final dvmPubkey in dvmPubkeys) {
-      final relayList = await _ndk.userRelayLists.getSingleUserRelayList(
-        dvmPubkey,
+    for (final jobId in jobIds) {
+      await _syncEngine.forgetFilter(
+        _feedbackFilter([jobId]),
+        authPubkey: pubkey,
       );
-      relays.addAll(relayList?.writeUrls ?? const []);
     }
-    return _orBootstrap(relays);
   }
 
-  List<String> _orBootstrap(Iterable<String>? relays) {
-    final urls = (relays?.toList() ?? [])..sort();
-    return urls.isEmpty ? [..._ndk.config.bootstrapRelays] : urls;
-  }
+  /// [pubkey]'s NIP-37 private relays as far as the NDK cache knows them, for
+  /// the live subscription. The sync engine fetches the list itself.
+  Future<List<String>> _cachedPrivateRelays(String pubkey) async =>
+      switch (await resolveUrlSet(
+        UrlSet.private(pubkey),
+        ndkUrlListFn(_ndk, offline: true),
+      )) {
+        UrlsResolved(:final urls) => urls,
+        UrlsUnavailable() => const [],
+      };
+
+  /// Where [dvmPubkeys] publish their kind:7000: their own NIP-65 write relays,
+  /// a feedback carrying no `p` tag to route on.
+  UrlSet _feedbackRelaySet(Iterable<String> dvmPubkeys) => _orBootstrap(
+    UrlSet.union([
+      for (final dvmPubkey in {...dvmPubkeys})
+        if (dvmPubkey.isNotEmpty) UrlSet.outbox(dvmPubkey),
+    ]),
+  );
+
+  UrlSet _orBootstrap(UrlSet set) =>
+      UrlSet.fallback([set, UrlSet.explicit(_ndk.config.bootstrapRelays)]);
 
   bool _sameStrings(Iterable<String>? a, Iterable<String>? b) {
     final left = a?.toList() ?? const [];
@@ -1118,6 +1037,7 @@ class EventScheduler {
       job.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       await _store.putJob(job);
     }
+    _scheduleFeedbackUpdate(pubkey);
   }
 
   // --------------------------------------------------------------------------
@@ -1210,6 +1130,7 @@ class EventScheduler {
 
       await _store.putJob(job);
       await _applyCachedFeedbacks(job);
+      _scheduleFeedbackUpdate(job.pubkey);
     } catch (_) {
       // Invalid payload, ignore
     }
@@ -1274,6 +1195,7 @@ class EventScheduler {
       request.updatedAt = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       job.updatedAt = request.updatedAt;
       await _store.putJob(job);
+      if (status.isFinal) _scheduleFeedbackUpdate(job.pubkey);
 
       if (notify) {
         _statusController.add(
@@ -1326,17 +1248,18 @@ class EventScheduler {
     });
   }
 
-  /// Retargets what follows [pubkey]'s jobs after the set of jobs changed: the
-  /// live subscription and, through it, the feedback sync request.
+  /// Retargets the live subscription and the sync requests following
+  /// [pubkey]'s feedbacks after the jobs awaiting one changed.
   Future<void> _updateFeedbackTargets(String pubkey) async {
     await _declaring(pubkey, () => _declareFeedbackNow(pubkey));
 
+    final jobIds = [
+      for (final job in await _jobsAwaitingFeedback(pubkey)) job.jobId,
+    ];
     final state = _sync[pubkey];
-    if (state == null) return;
+    if (state == null || _sameStrings(jobIds, state.feedbackJobIds)) return;
 
     await state.closeFeedback(_ndk);
-
-    final jobIds = (await _store.listJobs(pubkey)).map((j) => j.jobId).toList();
     if (jobIds.isEmpty) return;
 
     final response = _ndk.requests.subscription(
@@ -1344,6 +1267,7 @@ class EventScheduler {
       cacheWrite: true,
       auth: _authOf(pubkey),
     );
+    state.feedbackJobIds = jobIds;
     state.feedbackRequestId = response.requestId;
     state.feedbackSubscription = response.stream.listen(_onRawEvent);
   }
@@ -1598,6 +1522,7 @@ class _AccountSync {
   final List<StreamSubscription<Nip01Event>> subscriptions = [];
   String? feedbackRequestId;
   StreamSubscription<Nip01Event>? feedbackSubscription;
+  List<String> feedbackJobIds = const [];
 
   /// Whether listening took a hold on the account's sync requests.
   bool syncHeld = false;
@@ -1623,6 +1548,7 @@ class _AccountSync {
     }
     await feedbackSubscription?.cancel();
     feedbackSubscription = null;
+    feedbackJobIds = const [];
   }
 }
 
@@ -1631,22 +1557,26 @@ class _AccountDeclaration {
   int holders = 0;
   _DeclaredRequest? own;
   _DeclaredRequest? manifests;
-  _DeclaredRequest? feedback;
+  final Map<String, _DeclaredRequest> feedback = {};
 
   /// Last state pushed on `syncState`, so a stream of progress pages does not
   /// repeat it.
   SyncStatus? lastStatus;
   String? lastError;
 
-  Iterable<_DeclaredRequest> get requests => [?own, ?manifests, ?feedback];
+  Iterable<_DeclaredRequest> get requests => [
+    ?own,
+    ?manifests,
+    ...feedback.values,
+  ];
 
   Future<void> dispose(SyncEngine engine) async {
-    for (final declared in requests) {
+    for (final declared in requests.toList()) {
       await declared.dispose(engine);
     }
     own = null;
     manifests = null;
-    feedback = null;
+    feedback.clear();
   }
 }
 

@@ -1,3 +1,24 @@
+## 0.7.0
+
+- **Breaking**: require `sync_engine_shim_for_ndk: ^0.9.1`. The host building
+  the `SyncEngine` must move to it too, where it takes
+  `store: SembastSyncStore(db)` instead of `db`.
+- The sync requests name their relays as `UrlSet`s and let the engine resolve
+  them on every pass: the account's events read
+  `fallback(outbox(account), bootstrap)`, its manifests `private(account)`, and
+  the feedbacks `fallback(union(outbox(dvms)), bootstrap)`. An account moving
+  its relays is followed while listening, where the relays were fixed at the
+  first declaration.
+- The account's `kind:10013` is no longer the caller's to fetch: the engine
+  looks it up on the relays, once per `relayListMaxAge`, and another device's
+  private manifests are read without the host doing anything.
+- Feedbacks are synced per job, and only for jobs a DVM may still report on. A
+  job settled on every DVM (`published`, `failed`, `cancelled` or `error`) is
+  no longer polled, and a new job no longer resets the coverage of the others.
+- A job learned from another device while listening is followed at once,
+  rather than on the next `resync`.
+- `JobStatus.isFinal` tells whether a DVM sends anything after a status.
+
 ## 0.6.0
 
 - **Breaking**: require `broadcast_queue_shim_for_ndk: ^0.8.0`. The host

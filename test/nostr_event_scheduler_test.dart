@@ -30,7 +30,11 @@ Future<(EventScheduler, SyncEngine)> createScheduler({
   );
   broadcast.start();
 
-  final syncEngine = SyncEngine(ndk, db: schedulerDb);
+  final syncEngine = SyncEngine(
+    ndk,
+    store: SembastSyncStore(schedulerDb),
+    discoveryRelays: relayListDiscoveryRelays,
+  );
   syncEngine.start();
 
   final scheduler = EventScheduler(
@@ -793,7 +797,7 @@ void main() {
       final dvmDb = await databaseFactoryMemory.openDatabase(
         'dvm_integration_${DateTime.now().microsecondsSinceEpoch}.db',
       );
-      final dvmSyncEngine = SyncEngine(dvmNdk, db: dvmDb);
+      final dvmSyncEngine = SyncEngine(dvmNdk, store: SembastSyncStore(dvmDb));
       dvmSyncEngine.start();
       final dvm = SchedulerDvm(
         SchedulerDvmConfig(
@@ -907,7 +911,10 @@ void main() {
         final dvmDb = await databaseFactoryMemory.openDatabase(
           'dvm_redundant_${key.publicKey}_${DateTime.now().microsecondsSinceEpoch}.db',
         );
-        final dvmSyncEngine = SyncEngine(dvmNdk, db: dvmDb);
+        final dvmSyncEngine = SyncEngine(
+          dvmNdk,
+          store: SembastSyncStore(dvmDb),
+        );
         dvmSyncEngine.start();
         final dvm = SchedulerDvm(
           SchedulerDvmConfig(
@@ -1372,22 +1379,18 @@ void main() {
       );
     });
 
-    test('never asks a relay for the kind:10013', () async {
-      // An account that publishes no kind:10013 caches nothing either, so a
-      // lookup that went to the relays would go there again on every
-      // declaration, for the majority of accounts.
-      //
-      // Nothing is broadcast here on purpose: the write side resolves the list
-      // itself, through the shim, and that query is a legitimate one.
+    test('asks a relay for the kind:10013 once, not per pass', () async {
+      // Most accounts publish none, and a missing list must not be asked for
+      // again on every declaration.
       await scheduler.startListening(pubkey: clientKey.publicKey);
       await scheduler.resync(pubkey: clientKey.publicKey);
+      await scheduler.resync(pubkey: clientKey.publicKey);
 
-      expect(relay.reqsPerKind[10013], isNull);
+      expect(relay.reqsPerKind[10013], 1);
     });
 
-    test('ignores a kind:10013 the cache does not hold', () async {
-      // The other side of that contract, and the reason it is the caller's
-      // job to fetch the list: on the relay is not good enough.
+    test('reads a kind:10013 the cache does not hold', () async {
+      // Published from another device: only the relay has it.
       await publishPrivateRelayList();
       await ndk.config.cache.removeEvents(
         pubKeys: [clientKey.publicKey],
@@ -1397,7 +1400,7 @@ void main() {
       await scheduler.startListening(pubkey: clientKey.publicKey);
       await scheduler.resync(pubkey: clientKey.publicKey);
 
-      expect(privateRelay.reqsPerKind, isEmpty);
+      expect(privateRelay.reqsPerKind.keys, contains(31234));
     });
 
     test('picks up a kind:10013 that reaches the cache mid-session', () async {
@@ -1413,8 +1416,8 @@ void main() {
         reason: 'nothing should have been asked of the private relay yet',
       );
 
-      // No restart and no cache invalidation to arrange: the next declaration
-      // re-reads the cache, which now holds the list.
+      // No restart and no cache invalidation to arrange: a list published
+      // since wins over the lookup that found none.
       await scheduler.resync(pubkey: clientKey.publicKey);
       final after = await schedulePackageOfTwo('after the list');
       await Future.delayed(const Duration(milliseconds: 800));
@@ -1487,6 +1490,54 @@ void main() {
   });
 
   group('DVM feedback', () {
+    test('stops following a job once every DVM settled it', () async {
+      final signedEvent = await ndk.accounts.getLoggedAccount()!.signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: 'settled job',
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+      final job = await scheduler.schedule(
+        signedEvent,
+        [dvmKey.publicKey],
+        relays: [relay.url],
+        pubkey: clientKey.publicKey,
+      );
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      final following = syncEngine.engineStatus.activeRequests;
+
+      await publishFeedback(dvm: dvmKey, jobId: job.jobId, status: 'published');
+
+      await _waitFor(
+        () => syncEngine.engineStatus.activeRequests == following - 1,
+      );
+    });
+
+    test('follows a job another device schedules while listening', () async {
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      // Past the debounce of startListening, which would cover it otherwise.
+      await Future.delayed(const Duration(milliseconds: 800));
+      final jobId = await publishScheduleRequest(dvm: dvmKey);
+      await _waitFor(
+        () async => (await scheduler.listJobs(
+          pubkey: clientKey.publicKey,
+        )).any((job) => job.jobId == jobId),
+      );
+      // Past the debounce, so the live subscription follows the new job too.
+      await Future.delayed(const Duration(milliseconds: 800));
+
+      await publishFeedback(dvm: dvmKey, jobId: jobId, status: 'scheduled');
+
+      await _waitFor(
+        () async => (await scheduler.listJobs(pubkey: clientKey.publicKey)).any(
+          (job) => job.jobId == jobId && job.status == JobStatus.scheduled,
+        ),
+      );
+    });
+
     test('emits a StatusUpdate when kind:7000 is received', () async {
       final event = Nip01Event(
         pubKey: clientKey.publicKey,

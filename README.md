@@ -43,7 +43,7 @@ Future<void> main() async {
 
   // Caller-owned and shareable: the scheduler declares its own sync requests
   // and only ever forgets those.
-  final syncEngine = SyncEngine(ndk, db: db);
+  final syncEngine = SyncEngine(ndk, store: SembastSyncStore(db));
   syncEngine.start();
 
   final scheduler = EventScheduler(

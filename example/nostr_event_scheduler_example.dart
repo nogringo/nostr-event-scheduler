@@ -19,7 +19,7 @@ Future<void> main() async {
   final broadcast = OfflineBroadcast.withNdk(ndk, db: db);
   broadcast.start();
 
-  final syncEngine = SyncEngine(ndk, db: db);
+  final syncEngine = SyncEngine(ndk, store: SembastSyncStore(db));
   syncEngine.start();
 
   final scheduler = EventScheduler(

@@ -18,6 +18,9 @@ enum JobStatus {
   /// The job request was invalid.
   error;
 
+  /// Whether a DVM sends no further feedback after this status.
+  bool get isFinal => this != pending && this != scheduled;
+
   /// Aggregates the statuses of the requests of one job.
   ///
   /// One publication is enough, so the most advanced status wins:
