@@ -269,6 +269,17 @@ A package adds a `kind:31234` manifest over the jobs of its items. The manifest 
 `cancelPackage` therefore signs **two** deletions rather than one. The first tags every `kind:5905` of the package and goes to the account's relays plus every DVM's read relays, where the DVMs must see it to cancel. The second tags only the manifest and follows the manifest's own relays.
 
 ```dart
+Future<void> deleteJobs(Iterable<String> jobIds, {required String pubkey});
+Future<void> deletePackages(Iterable<String> packageIds, {required String pubkey});
+```
+
+Clears the history from the relays. Where `cancel` stops a publication, these never do: every job must have settled (`JobStatus.isFinal`), or the call throws before signing anything. A job linked by a package is refused by `deleteJobs` and deleted with its package, so a manifest never names a request that is gone.
+
+The DVMs are kept out of it. A DVM reads every `kind:5` tagging it with `p` and `k:5905`, and answers a request it already settled with an `error` feedback, so the settled requests go in a deletion with no `p` tag. A request still open on its DVM, the job having been published through another one, goes in a second deletion naming that DVM, which drops it. Two deletions at most, since one naming a DVM would make it answer for every one of its own requests it lists. A package request whose job is unknown locally counts as settled: a deletion must never cancel what may still publish.
+
+Both deletions go wherever the requests went, the account's NIP-65 relays plus every DVM's read relays. `deletePackages` signs one more for the manifests, on their own relays. Locally, the requests are tombstoned and the projections removed, as on a cancel.
+
+```dart
 Future<List<ScheduledJob>> listJobs({required String pubkey});
 Stream<List<ScheduledJob>> jobsStream({required String pubkey});
 ```

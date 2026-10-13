@@ -1197,6 +1197,267 @@ void main() {
     );
   });
 
+  group('delete', () {
+    Future<Nip01Event> signNote(String content) {
+      return ndk.accounts.getLoggedAccount()!.signer.sign(
+        Nip01Event(
+          pubKey: clientKey.publicKey,
+          kind: 1,
+          tags: [],
+          content: content,
+          createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+    }
+
+    Future<ScheduledJob> scheduleNote(
+      String content,
+      List<KeyPair> dvms,
+    ) async {
+      return scheduler.schedule(
+        await signNote(content),
+        [for (final dvm in dvms) dvm.publicKey],
+        relays: [relay.url],
+        pubkey: clientKey.publicKey,
+      );
+    }
+
+    Future<void> waitForRequestStatus(
+      String jobId,
+      KeyPair dvm,
+      JobStatus status,
+    ) => _waitFor(() async {
+      final job = (await scheduler.listJobs(
+        pubkey: clientKey.publicKey,
+      )).where((job) => job.jobId == jobId).firstOrNull;
+      return job?.requestForDvm(dvm.publicKey)?.status == status;
+    });
+
+    Future<void> settle(String jobId, KeyPair dvm, String status) async {
+      await publishFeedback(dvm: dvm, jobId: jobId, status: status);
+      await waitForRequestStatus(jobId, dvm, JobStatus.values.byName(status));
+    }
+
+    Future<List<Nip01Event>> waitForDeletions(int count) async {
+      final filter = Filter(kinds: [5], authors: [clientKey.publicKey]);
+      await _waitFor(() async => (await relayQuery(filter)).length >= count);
+      return relayQuery(filter);
+    }
+
+    Future<void> listen() async {
+      await scheduler.startListening(pubkey: clientKey.publicKey);
+      // Past the debounce, so the live subscription follows the jobs.
+      await Future.delayed(const Duration(milliseconds: 800));
+    }
+
+    test('deleteJobs retracts settled requests without their DVMs', () async {
+      final job = await scheduleNote('delete me', [dvmKey]);
+      await listen();
+      await settle(job.jobId, dvmKey, 'published');
+
+      await scheduler.deleteJobs([job.jobId], pubkey: clientKey.publicKey);
+
+      final deletion = (await waitForDeletions(1)).single;
+      expect(deletion.getTags('e'), job.requestEventIds);
+      expect(deletion.getTags('k'), ['5905']);
+      expect(deletion.getTags('p'), isEmpty);
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+    });
+
+    test('deleteJobs tells a DVM still holding a request to drop it', () async {
+      final job = await scheduleNote('half settled', [dvmKey, dvm2Key]);
+      await listen();
+      await settle(job.jobId, dvmKey, 'published');
+      await settle(job.jobId, dvm2Key, 'scheduled');
+
+      await scheduler.deleteJobs([job.jobId], pubkey: clientKey.publicKey);
+
+      final deletions = await waitForDeletions(2);
+      final quiet = deletions.singleWhere((e) => e.getTags('p').isEmpty);
+      final notified = deletions.singleWhere((e) => e.getTags('p').isNotEmpty);
+      expect(quiet.getTags('e'), [
+        job.requestForDvm(dvmKey.publicKey)!.requestEventId,
+      ]);
+      expect(notified.getTags('e'), [
+        job.requestForDvm(dvm2Key.publicKey)!.requestEventId,
+      ]);
+      expect(notified.getTags('p'), [dvm2Key.publicKey]);
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+    });
+
+    test('deleteJobs refuses an unsettled job and deletes nothing', () async {
+      final settled = await scheduleNote('settled', [dvmKey]);
+      final pending = await scheduleNote('pending', [dvmKey]);
+      await listen();
+      await settle(settled.jobId, dvmKey, 'published');
+
+      await expectLater(
+        scheduler.deleteJobs([
+          settled.jobId,
+          pending.jobId,
+        ], pubkey: clientKey.publicKey),
+        throwsArgumentError,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 500));
+      expect(
+        await relayQuery(Filter(kinds: [5], authors: [clientKey.publicKey])),
+        isEmpty,
+      );
+      expect(
+        await scheduler.listJobs(pubkey: clientKey.publicKey),
+        hasLength(2),
+      );
+    });
+
+    test('deleteJobs refuses a job linked by a package', () async {
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: await signNote('packaged'),
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'package',
+        pubkey: clientKey.publicKey,
+      );
+      final jobId = package.jobs.single.jobId;
+      await listen();
+      await settle(jobId, dvmKey, 'published');
+
+      await expectLater(
+        scheduler.deleteJobs([jobId], pubkey: clientKey.publicKey),
+        throwsArgumentError,
+      );
+    });
+
+    test('deletePackages retracts the requests and the manifest', () async {
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: await signNote('package B'),
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+          SchedulePackageItem(
+            event: await signNote('package C'),
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'delete me',
+        pubkey: clientKey.publicKey,
+      );
+      await listen();
+      for (final job in package.jobs) {
+        await settle(job.jobId, dvmKey, 'published');
+      }
+
+      await scheduler.deletePackages([
+        package.packageId,
+      ], pubkey: clientKey.publicKey);
+
+      final deletions = await waitForDeletions(2);
+      final manifestDeletion = deletions.singleWhere(
+        (event) => event.getTags('k').contains('31234'),
+      );
+      expect(manifestDeletion.getTags('e'), [package.manifestEventId]);
+      expect(manifestDeletion.getTags('p'), isEmpty);
+
+      final requestDeletion = deletions.singleWhere(
+        (event) => event.getTags('k').contains('5905'),
+      );
+      expect(
+        requestDeletion.getTags('e'),
+        unorderedEquals(package.requestEventIds),
+      );
+      expect(requestDeletion.getTags('p'), isEmpty);
+
+      expect(await scheduler.listJobs(pubkey: clientKey.publicKey), isEmpty);
+      expect(
+        await scheduler.listSchedules(pubkey: clientKey.publicKey),
+        isEmpty,
+      );
+    });
+
+    test('deletePackages refuses a package with an unsettled job', () async {
+      final package = await scheduler.schedulePackage(
+        [
+          SchedulePackageItem(
+            event: await signNote('not yet'),
+            dvmPubkeys: [dvmKey.publicKey],
+            relays: [relay.url],
+          ),
+        ],
+        content: 'unsettled',
+        pubkey: clientKey.publicKey,
+      );
+
+      await expectLater(
+        scheduler.deletePackages([
+          package.packageId,
+        ], pubkey: clientKey.publicKey),
+        throwsArgumentError,
+      );
+      expect(
+        await scheduler.listPackages(pubkey: clientKey.publicKey),
+        hasLength(1),
+      );
+    });
+
+    test('a real DVM sends no feedback for a deleted job', () async {
+      final dvmNdk = Ndk(
+        NdkConfig(
+          eventVerifier: Bip340EventVerifier(useIsolate: false),
+          cache: MemCacheManager(),
+          bootstrapRelays: [relay.url],
+          defaultQueryTimeout: const Duration(seconds: 2),
+          defaultBroadcastTimeout: const Duration(seconds: 2),
+        ),
+      );
+      dvmNdk.accounts.loginPrivateKey(
+        pubkey: dvmKey.publicKey,
+        privkey: dvmKey.privateKey!,
+      );
+      final dvmDb = await databaseFactoryMemory.openDatabase(
+        'dvm_delete_${DateTime.now().microsecondsSinceEpoch}.db',
+      );
+      final dvmSyncEngine = SyncEngine(dvmNdk, store: SembastSyncStore(dvmDb));
+      dvmSyncEngine.start();
+      final dvm = SchedulerDvm(
+        SchedulerDvmConfig(
+          ndk: dvmNdk,
+          store: SembastDvmJobStore(dvmDb),
+          syncEngine: dvmSyncEngine,
+          bootstrapRelays: [relay.url],
+          announceNip89: false,
+          targetRelayPolicy: RelayUrlPolicy.permissive,
+        ),
+      );
+      addTearDown(() async {
+        await dvm.dispose();
+        await dvmSyncEngine.dispose();
+        await dvmDb.close();
+        await dvmNdk.destroy();
+      });
+      await dvm.start();
+
+      final job = await scheduleNote('published right away', [dvmKey]);
+      await listen();
+      await waitForRequestStatus(job.jobId, dvmKey, JobStatus.published);
+
+      final feedbackFilter = Filter(kinds: [7000])..setTag('r', [job.jobId]);
+      final feedbackCount = (await relayQuery(feedbackFilter)).length;
+
+      await scheduler.deleteJobs([job.jobId], pubkey: clientKey.publicKey);
+      await waitForDeletions(1);
+      await Future.delayed(const Duration(seconds: 1));
+
+      expect(await relayQuery(feedbackFilter), hasLength(feedbackCount));
+    });
+  });
+
   group('multi-device sync', () {
     test('recovers a kind:5905 from the relay', () async {
       final jobId = await publishScheduleRequest(dvm: dvmKey);

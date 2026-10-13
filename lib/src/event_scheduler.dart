@@ -533,6 +533,129 @@ class EventScheduler {
     await _store.removePackage(package.packageId);
   }
 
+  /// Deletes settled jobs of [pubkey] from the relays, to clear its history.
+  ///
+  /// Unlike [cancel], this never stops a publication: every job must have
+  /// settled, or nothing is deleted. Its DVMs are left out of the deletion,
+  /// since a DVM asked to cancel a request it already settled answers with an
+  /// error feedback. Only a DVM whose request is still open, the job having
+  /// been published through another one, is told to drop it.
+  ///
+  /// Jobs linked by a package are deleted with [deletePackages].
+  Future<void> deleteJobs(
+    Iterable<String> jobIds, {
+    required String pubkey,
+  }) async {
+    final ids = {...jobIds};
+    if (ids.isEmpty) return;
+    await _ensureBuilt(pubkey);
+
+    final packagedRequestIds = {
+      for (final package in await _store.listPackages(pubkey))
+        ...package.requestEventIds,
+    };
+    final jobs = <ScheduledJob>[];
+    for (final jobId in ids) {
+      final job = await _store.getJob(jobId);
+      if (job == null || job.pubkey != pubkey) {
+        throw ArgumentError('Job not found for $pubkey: $jobId');
+      }
+      if (!job.status.isFinal) {
+        throw ArgumentError('Job $jobId has not settled: ${job.status.name}');
+      }
+      if (job.requestEventIds.any(packagedRequestIds.contains)) {
+        throw ArgumentError('Job $jobId belongs to a package');
+      }
+      jobs.add(job);
+    }
+
+    final settled = <String, String>{};
+    final open = <String, String>{};
+    for (final request in jobs.expand((job) => job.requests)) {
+      final target = request.status.isFinal ? settled : open;
+      target[request.requestEventId] = request.dvmPubkey;
+    }
+    await _retractRequests(pubkey, settled, notifyDvms: false);
+    await _retractRequests(pubkey, open, notifyDvms: true);
+
+    for (final job in jobs) {
+      await _store.removeJob(job.jobId);
+    }
+    _scheduleFeedbackUpdate(pubkey);
+  }
+
+  /// Deletes settled packages of [pubkey] from the relays: their manifests
+  /// and every kind:5905 they link, as [deleteJobs] does for a job.
+  ///
+  /// A request whose job is unknown here, its payload not decrypted yet, is
+  /// deleted without telling its DVM, so a deletion never cancels a job that
+  /// may still publish.
+  Future<void> deletePackages(
+    Iterable<String> packageIds, {
+    required String pubkey,
+  }) async {
+    final ids = {...packageIds};
+    if (ids.isEmpty) return;
+    await _ensureBuilt(pubkey);
+
+    final packages = <ScheduledPackage>[];
+    for (final packageId in ids) {
+      final package = await _store.getPackage(packageId);
+      if (package == null || package.pubkey != pubkey) {
+        throw ArgumentError('Package not found for $pubkey: $packageId');
+      }
+      final open = package.jobs.where((j) => !j.status.isFinal).firstOrNull;
+      if (open != null) {
+        throw ArgumentError(
+          'Package $packageId has a job that has not settled: ${open.jobId}',
+        );
+      }
+      packages.add(package);
+    }
+
+    final settled = <String, String>{};
+    final open = <String, String>{};
+    for (final package in packages) {
+      for (final requestEventId in package.requestEventIds) {
+        final request = package.jobs
+            .map((job) => job.requestForEventId(requestEventId))
+            .nonNulls
+            .firstOrNull;
+        if (request != null) {
+          final target = request.status.isFinal ? settled : open;
+          target[requestEventId] = request.dvmPubkey;
+        } else if (!await _store.isTombstoned(requestEventId)) {
+          settled[requestEventId] =
+              await _dvmPubkeyForRequestEventId(pubkey, requestEventId) ?? '';
+        }
+      }
+    }
+    await _retractRequests(pubkey, settled, notifyDvms: false);
+    await _retractRequests(pubkey, open, notifyDvms: true);
+    for (final requestEventId in [...settled.keys, ...open.keys]) {
+      await _removeRequestFromJobs(requestEventId, pubkey);
+    }
+
+    final manifestDeletion = await _signDeletion(
+      pubkey: pubkey,
+      eventIds: packages.map((package) => package.manifestEventId),
+      kinds: const [kindPackageManifest],
+      content: 'delete package',
+    );
+    await _broadcast.broadcast(
+      manifestDeletion,
+      relaySet: _manifestRelaySet(pubkey),
+      pubkey: pubkey,
+    );
+    for (final package in packages) {
+      await _store.putTombstone(
+        package.manifestEventId,
+        deletionEventId: manifestDeletion.id,
+      );
+      await _store.removePackage(package.packageId);
+    }
+  }
+
   /// Lists [pubkey]'s scheduled packages from the local computed store.
   Future<List<ScheduledPackage>> listPackages({required String pubkey}) async {
     await _ensureBuilt(pubkey);
@@ -1383,6 +1506,34 @@ class EventScheduler {
     final signed = await signer.sign(deletion);
     await _ndk.config.cache.saveEvent(signed);
     return signed;
+  }
+
+  /// Retracts the kind:5905 [requests], keyed by event id to their DVM, with
+  /// one deletion that goes wherever they were sent. Only when [notifyDvms]
+  /// does it name the DVMs, which then cancel: a DVM tagged in a deletion acts
+  /// on every request of its own the deletion lists.
+  Future<void> _retractRequests(
+    String pubkey,
+    Map<String, String> requests, {
+    required bool notifyDvms,
+  }) async {
+    if (requests.isEmpty) return;
+
+    final deletion = await _signDeletion(
+      pubkey: pubkey,
+      eventIds: requests.keys,
+      kinds: const [kindScheduleRequest],
+      content: 'delete',
+      dvmPubkeys: notifyDvms ? requests.values : const [],
+    );
+    await _broadcast.broadcast(
+      deletion,
+      relaySet: _deletionRelaySet(pubkey, requests.values),
+      pubkey: pubkey,
+    );
+    for (final requestEventId in requests.keys) {
+      await _store.putTombstone(requestEventId, deletionEventId: deletion.id);
+    }
   }
 
   /// Writes a locally created event and its plaintext to the raw tier.

@@ -1,3 +1,11 @@
+## 0.7.1
+
+- `deleteJobs` and `deletePackages` clear settled schedules from the relays.
+  Unlike `cancel`, they refuse a job that has not settled. The settled requests
+  are deleted without a `p` tag, so their DVMs do not answer with an `error`
+  feedback. A request still open on a DVM, the job having been published
+  through another one, is deleted in a second `kind:5` naming that DVM.
+
 ## 0.7.0
 
 - **Breaking**: require `sync_engine_shim_for_ndk: ^0.9.1`. The host building

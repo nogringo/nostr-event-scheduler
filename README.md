@@ -160,6 +160,21 @@ Future<void> main() async {
   final schedules = await scheduler.listSchedules(pubkey: myPubKey);
   print('Total schedules: ${schedules.length}');
 
+  // Clear the settled schedules from the relays
+  final settled = schedules.where(
+    (item) => [?item.job, ...?item.package?.jobs].every(
+      (job) => job.status.isFinal,
+    ),
+  );
+  await scheduler.deleteJobs(
+    settled.map((item) => item.job?.jobId).nonNulls,
+    pubkey: myPubKey,
+  );
+  await scheduler.deletePackages(
+    settled.map((item) => item.package?.packageId).nonNulls,
+    pubkey: myPubKey,
+  );
+
   // Cancel a job
   await scheduler.cancel(job.jobId, pubkey: myPubKey);
 
@@ -194,6 +209,8 @@ Every method takes the account it acts for. The signer is resolved from `ndk.acc
 | `schedulePackage(items, {content, pubkey})` | Creates a logical schedule backed by multiple DVM jobs |
 | `cancel(jobId, {pubkey})` | Cancels a job (all its DVM requests) with one kind:5 deletion |
 | `cancelPackage(packageId, {pubkey})` | Cancels all jobs in a package and deletes its manifest |
+| `deleteJobs(jobIds, {pubkey})` | Deletes settled jobs from the relays, to clear the history |
+| `deletePackages(packageIds, {pubkey})` | Deletes settled packages, their manifests and jobs, from the relays |
 | `listJobs({pubkey})` | Lists the account's scheduled jobs from the local store |
 | `listPackages({pubkey})` | Lists the account's scheduled packages from the local store |
 | `listSchedules({pubkey})` | Lists logical schedules: standalone jobs plus packages |
@@ -205,6 +222,8 @@ Every method takes the account it acts for. The signer is resolved from `ndk.acc
 | `syncState` | Stream of per-account sync state (initial / syncing / synced / error) |
 
 `clearLocalAccountData` is a local reset, not a protocol-level forget: the requests still live on the relays, so an account whose signer is still loaded rebuilds them on its next `resync()`. Use `cancel` to actually retract a schedule.
+
+`deleteJobs` and `deletePackages` clear the history, they never stop a publication: every job must have settled (`published`, `failed`, `cancelled` or `error`), or nothing is deleted. The deletion leaves the DVMs out, since a DVM asked to cancel a request it already settled answers with an error feedback. A DVM whose request is still open, the job having been published through another one, is told to drop it. A job linked by a package is deleted with its package.
 
 ### Models
 
