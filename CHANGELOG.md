@@ -1,3 +1,9 @@
+## 0.7.2
+
+- `dispose` waits for a feedback update already past its timer, and a feedback
+  landing during `dispose` no longer arms a new one. Either could read the
+  store after `dispose` returned, and throw once the caller closed it.
+
 ## 0.7.1
 
 - `deleteJobs` and `deletePackages` clear settled schedules from the relays.

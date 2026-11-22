@@ -39,12 +39,15 @@ class EventScheduler {
   final Map<String, _AccountSync> _sync = {};
   final Map<String, _AccountDeclaration> _declarations = {};
   final Map<String, Timer> _feedbackTimers = {};
+  final Set<Future<void>> _feedbackUpdates = {};
   final Map<String, Future<void>> _declareLocks = {};
   final Map<String, Future<void>> _building = {};
   final Map<String, Future<void>> _replaying = {};
 
   final _statusController = StreamController<StatusUpdate>.broadcast();
   final _syncController = StreamController<SyncState>.broadcast();
+
+  bool _disposed = false;
 
   /// Creates a new [EventScheduler].
   ///
@@ -718,12 +721,18 @@ class EventScheduler {
 
   /// Disposes all resources. The sync engine is caller-owned and outlives this.
   Future<void> dispose() async {
+    _disposed = true;
     await stopListening();
 
     for (final timer in _feedbackTimers.values) {
       timer.cancel();
     }
     _feedbackTimers.clear();
+    // An update past its timer still reads the store, which the caller is free
+    // to close once this returns.
+    await Future.wait([
+      for (final update in _feedbackUpdates.toList()) update.catchError((_) {}),
+    ]);
 
     // A resync still in flight holds declarations of its own.
     for (final declaration in _declarations.values.toList()) {
@@ -1363,11 +1372,16 @@ class EventScheduler {
   // Internals - Feedback subscription
   // --------------------------------------------------------------------------
 
+  /// A feedback landing while [dispose] runs must not arm a timer it already
+  /// went past.
   void _scheduleFeedbackUpdate(String pubkey) {
+    if (_disposed) return;
     _feedbackTimers[pubkey]?.cancel();
     _feedbackTimers[pubkey] = Timer(const Duration(milliseconds: 500), () {
       _feedbackTimers.remove(pubkey);
-      unawaited(_updateFeedbackTargets(pubkey));
+      final update = _updateFeedbackTargets(pubkey);
+      _feedbackUpdates.add(update);
+      unawaited(update.whenComplete(() => _feedbackUpdates.remove(update)));
     });
   }
 
